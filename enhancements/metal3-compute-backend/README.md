@@ -11,6 +11,8 @@ see-also:
   - enhancements/inventory-provisioning-separation/README.md
   - enhancements/image-and-sshkey-resources/README.md
   - enhancements/carbide-integration/README.md
+  - https://github.com/osac-project/enhancement-proposals/pull/20 (Region/AZ)
+  - https://github.com/osac-project/enhancement-proposals/pull/31 (Bare Metal Fulfillment v2)
 replaces:
 superseded-by:
 ---
@@ -21,9 +23,8 @@ superseded-by:
 
 Implement a Metal3/Ironic-based ComputeInstanceTemplate backend for
 OSAC that provisions bare-metal compute instances using BareMetalHost
-custom resources. This backend integrates with NVLink partition
-management (nvidia.nmx) and InfiniBand partition management
-(nvidia.ufm) for GPU-accelerated bare-metal deployments.
+custom resources. This backend provisions bare-metal compute
+instances for GPU-accelerated and general-purpose deployments.
 
 Metal3 is the standard Kubernetes-native bare-metal provisioning
 system used by OpenShift. This backend enables OSAC to provision
@@ -68,12 +69,6 @@ OpenShift bare-metal IPI installations.
   provisioning backend, so that I can use GA, supported Red Hat
   technology.
 
-- As a **cloud provider**, I want NVLink partition isolation for
-  multi-tenant GPU inference workloads, without requiring NICo.
-
-- As a **cloud provider**, I want InfiniBand tenant isolation for
-  HPC/training workloads, without requiring NICo.
-
 - As a **tenant**, I want to provision bare-metal GPU servers
   through the same ComputeInstance API I use for VMs.
 
@@ -82,9 +77,9 @@ OpenShift bare-metal IPI installations.
 - Implement a Metal3 ComputeInstanceTemplate as an Ansible role in
   `osac.templates`.
 - Support RHEL (image-mode/bootc) and RHCOS images via Metal3.
-- Integrate nvidia.nmx for NVLink partition management on NVL72.
-- Integrate nvidia.ufm for InfiniBand PKEY tenant isolation.
-- Follow the inventory/provisioning separation pattern from EP 3.
+- Follow the inventory/provisioning separation pattern from the
+  [inventory-provisioning-separation](../inventory-provisioning-separation/README.md)
+  EP.
 - Support ComputeInstanceGroup scaling.
 
 ### Non-Goals
@@ -108,6 +103,12 @@ role: "metal3_bm"
 roleCollection: "osac.templates"
 ```
 
+The `site` field maps to the Region/AZ topology defined in the
+[Region/AZ EP](https://github.com/osac-project/enhancement-proposals/pull/20).
+A ComputeInstanceClass references one template per site, enabling
+multi-site deployments where the same class is available at
+different locations.
+
 The template role `osac.templates.metal3_bm` implements three
 entry points: `install.yaml`, `delete.yaml`, and `status.yaml`.
 
@@ -119,7 +120,7 @@ The role receives pre-selected hosts from `osac.service.select_hosts`
 ```
 Input:
   compute_instance_hosts:     # pre-selected from AAP inventory
-  compute_instance_image:     # resolved Image (sourceRef, bootMethod)
+  compute_instance_image:     # resolved Image (sourceRef, bootMethod, checksum)
   compute_instance_ssh_keys:  # resolved SSH public key strings
   compute_instance_subnet:    # subnet reference
   compute_instance_class:     # ComputeInstanceClass
@@ -145,27 +146,22 @@ Steps:
    │ Watch BMH status.provisioning.state → "provisioned"
    │ Timeout: configurable (default 30 minutes)
    │
-4. Create NVLink partition (if multi-tenant GPU)
-   │ Condition: class has gpus.count > 0 AND
-   │            host shares NVLink domain with other tenants
-   │ Action: nvidia.nmx.partition (state: present)
-   │         - name: "tenant-{{ tenant_id }}"
-   │         - members: GPU UUIDs from host_vars
-   │
-5. Create InfiniBand partition (if IB fabric)
-   │ Condition: class has infiniband interfaces
-   │ Action: nvidia.ufm.pkey (state: present)
-   │         - pkey: computed from tenant_id
-   │         - guids: from host_vars
-   │
-6. Configure networking
-   │ Action: depends on NetworkClass of the referenced subnet
-   │ - dpf-ovn-vpc: DPUService CRD for OVN VPC (via kubernetes.core)
-   │ - udn-net: UDN CR (via kubernetes.core)
-   │
-7. Report success
+4. Report success
    │ Set compute_instance_ip_address from BMH status
    │ Set compute_instance_state: "RUNNING"
+
+**Networking and fabric isolation** are not handled by the
+template role. Network attachment (VPC, subnet, security groups),
+NVLink partition management (nvidia.nmx), and InfiniBand PKEY
+isolation (nvidia.ufm) are the responsibility of their respective
+NetworkClass controllers. These controllers watch for
+ComputeInstances attached to their subnets and create the
+appropriate resources (DPUService CRDs for dpf-ovn-vpc, NVLink
+partitions for GPU fabric, IB PKEYs for InfiniBand fabric).
+This follows the same separation principle as the
+inventory/provisioning separation: template roles provision
+compute, network providers provision networking and fabric
+isolation.
 ```
 
 ### Deprovisioning workflow (delete.yaml)
@@ -173,37 +169,29 @@ Steps:
 ```
 Steps:
 
-1. Remove NVLink partition
-   │ nvidia.nmx.partition (state: absent)
-   │
-2. Remove InfiniBand partition
-   │ nvidia.ufm.pkey (state: absent)
-   │
-3. Clean up networking
-   │ Remove DPUService or UDN CRs
-   │
-4. Deprovision BareMetalHost
+1. Deprovision BareMetalHost
    │ Set BMH spec.online: false
    │ Wait for BMH → deprovisioning → available
    │
-5. Update inventory
+2. Clean up userdata Secret
+   │ Delete the per-host userdata Secret
+   │
+3. Update inventory (handled by the workflow, not the template role)
    │ osac.service.update_host_state (state: available, tenant: none)
+
+**Networking and fabric cleanup** is not handled by the template
+role. NetworkClass controllers are responsible for removing
+network and fabric isolation resources (NVLink partitions, IB
+PKEYs, VPC attachments) when the ComputeInstance is deleted.
 ```
 
 ### AAP execution environment
 
-The Metal3 backend requires these collections:
-
-| Collection | Purpose |
-|---|---|
-| `kubernetes.core` | BareMetalHost CRD management |
-| `nvidia.nmx` | NVLink partition management |
-| `nvidia.ufm` | InfiniBand PKEY management |
-| `netbox.netbox` | Inventory (if NetBox is the inventory source) |
-
-These should NOT be added to a monolithic shared execution
-environment. Instead, the Metal3 backend should ship its own EE
-image that extends the OSAC core EE:
+The Metal3 template role requires `kubernetes.core` for
+BareMetalHost CRD management. This should NOT be added to the
+monolithic shared execution environment. Instead, the Metal3
+backend should ship its own EE image that extends the OSAC core
+EE:
 
 ```
 EE: osac-core (base — shared by all backends)
@@ -211,16 +199,22 @@ EE: osac-core (base — shared by all backends)
   ├── ansible.controller, ansible.eda
   └── osac.service, osac.templates, osac.workflows
 
-EE: osac-metal3-gpu (this backend)
-  ├── FROM osac-core
-  ├── nvidia.ufm, nvidia.nmx
-  └── netbox.netbox (if NetBox inventory)
+EE: osac-metal3 (this backend)
+  └── FROM osac-core
 ```
+
+Inventory plugin collections (e.g., `netbox.netbox`) belong in
+the AAP inventory configuration, not in the template role's EE —
+the template role receives pre-selected hosts from
+`osac.service.select_hosts` and never queries inventory directly.
+
+GPU fabric collections (`nvidia.nmx`, `nvidia.ufm`) belong in
+the EE of the network provider that handles NVLink/IB isolation,
+not in the compute provisioning EE.
 
 Each `ComputeInstanceTemplate` specifies which EE its AAP job
 template requires. The osac-operator passes this to AAP when
-launching the job. NCP operators install only the EEs they need —
-a VM-only deployment never pulls nvidia.ufm.
+launching the job.
 
 This pluggable EE model applies to all backends (ESI, NICo,
 KubeVirt). The `osac-aap-ee` repo should evolve from a single
@@ -234,15 +228,12 @@ inventory (per the inventory/provisioning separation EP):
 
 | host_var | Source | Required |
 |---|---|---|
-| `hostclass` | Inventory plugin | Yes |
+| `compute_instance_class` | Inventory plugin | Yes |
 | `state` | Inventory plugin | Yes |
 | `site` | Inventory plugin | Yes |
 | `bmc_address` | Inventory plugin | Yes |
 | `bmc_credentials_secret` | Inventory plugin | Yes |
 | `boot_mac_address` | Inventory plugin | Yes |
-| `nvlink_domain` | Inventory plugin | For GPU hosts |
-| `gpu_uuids` | Inventory plugin | For NVLink partitioning |
-| `ib_guids` | Inventory plugin | For IB partitioning |
 | `rack` | Inventory plugin | For placement |
 | `root_device` | Inventory plugin | Optional (default: /dev/nvme0n1) |
 
@@ -253,21 +244,15 @@ inventory (per the inventory/provisioning separation EP):
 ```yaml
 id: "gpu-b200-4"
 title: "4x B200 GPU Tray"
-backend: "baremetal"
+hardwareType: "baremetal"
 capabilities:
-  cores: 96
-  memoryGiB: 480
+  coresFixed: 96
+  memoryGibFixed: 480
   gpus:
     count: 4
     model: "B200"
   storage:
-    bootDiskGiB: 960
-  networking:
-    interfaces:
-      - type: "ethernet"
-        speed: "400Gbps"
-      - type: "infiniband"
-        speed: "400Gbps"
+    bootDiskGibFixed: 960
 templates:
   - name: "metal3-b200-paris"
     site: "paris"
@@ -280,12 +265,12 @@ templates:
 ```yaml
 id: "cpu-mgmt-64"
 title: "64-core Management Node"
-backend: "baremetal"
+hardwareType: "baremetal"
 capabilities:
-  cores: 64
-  memoryGiB: 256
+  coresFixed: 64
+  memoryGibFixed: 256
   storage:
-    bootDiskGiB: 480
+    bootDiskGibFixed: 480
 templates:
   - name: "metal3-cpu-paris"
     site: "paris"
@@ -334,18 +319,9 @@ setup guide covers Metal3 deployment.
 Metal3 requires BareMetalHost resources to exist before
 provisioning. These represent the physical machines.
 
-*Mitigation:* BareMetalHost resources can be created by the
-inventory system (NetBox sync job or manual registration). This
-is a day-0 setup task, not a per-tenant operation.
-
-#### NVLink/IB partition management requires NMX-M and UFM
-
-These are NVIDIA-specific services that must be deployed for GPU
-multi-tenancy.
-
-*Mitigation:* NVLink and IB partition steps are conditional — they
-only run when the ComputeInstanceClass includes GPU or IB
-capabilities. Non-GPU deployments work without NMX-M or UFM.
+*Mitigation:* BareMetalHost resources can be created by an
+inventory sync job or manual registration. This is a day-0 setup
+task, not a per-tenant operation.
 
 ### Drawbacks
 
@@ -353,7 +329,7 @@ capabilities. Non-GPU deployments work without NMX-M or UFM.
 - BareMetalHost pre-registration is a manual step (or requires
   inventory sync automation).
 
-## Alternatives
+## Alternatives (Not Implemented)
 
 ### Use NICo as the sole bare-metal backend
 
@@ -372,24 +348,85 @@ Kubernetes-native and works with any server that supports Redfish.
 ### Use NICo for GPU features, Metal3 for provisioning
 
 Hybrid approach where Metal3 handles PXE/OS provisioning and NICo
-handles VPC/NVLink/IB.
+handles networking and GPU fabric isolation.
 
 *Why this is possible but not required:* The unified compute model
-supports multiple backends. A provider can deploy both a Metal3
-template and a NICo template for the same ComputeInstanceClass.
-This EP focuses on the Metal3-only path; hybrid deployment is a
-provider configuration choice, not an architectural constraint.
+separates compute provisioning (template roles) from networking
+(NetworkClass controllers). A provider can use Metal3 for compute
+and NICo-based NetworkClass controllers for fabric isolation, or
+use standalone nvidia.nmx/nvidia.ufm-based controllers. This EP
+focuses on the compute provisioning path; the network provider
+choice is independent.
+
+### Relationship to BareMetalPool / HostLease (PR #31)
+
+The [updated bare-metal-fulfillment EP](https://github.com/osac-project/enhancement-proposals/pull/31)
+would implement Metal3 as a Host Management Operator — a Go
+controller that reconciles HostLease CRDs by creating
+BareMetalHost resources and managing their lifecycle.
+
+This EP implements the same compute provisioning logic as a
+ComputeInstanceTemplate Ansible role executed by AAP. The
+BareMetalHost creation and OS configuration steps are equivalent.
+The difference is execution
+context: a Kubernetes operator (PR #31) versus an AAP-executed
+Ansible role (this EP). The Ansible role approach is consistent
+with how OSAC handles all provisioning today — KubeVirt VMs, ESI
+bare metal, and cluster fulfillment all use AAP template roles.
+
+## Open Questions [optional]
+
+1. **BareMetalHost pre-creation.** Should the Metal3 role create
+   BareMetalHost CRDs from inventory data at provisioning time, or
+   should BMH CRDs be pre-created by a separate inventory sync job?
+   Pre-creation simplifies the role but requires a day-0 sync
+   mechanism.
+
+2. **Provisioning timeout handling.** When a BareMetalHost fails to
+   reach `provisioned` state within the timeout, should the role
+   retry the same host, select a different host via
+   `osac.service.select_hosts`, or fail the ComputeInstance?
 
 ## Test Plan
 
 TBD — will cover:
 - BareMetalHost creation and provisioning lifecycle
 - Image boot method handling (Ignition, cloud-init)
-- NVLink partition creation and deletion (with nvidia.nmx)
-- IB PKEY creation and deletion (with nvidia.ufm)
 - ComputeInstanceGroup scaling (add/remove bare-metal hosts)
 - Deprovisioning and inventory state update
 
 ## Graduation Criteria
 
 TBD
+
+## Upgrade / Downgrade Strategy
+
+The Metal3 backend is an Ansible role packaged in a per-backend
+execution environment (EE) image. Upgrading means deploying a new
+EE image version. Downgrading means reverting to the previous EE
+image. The `status.yaml` entry point should handle
+partially-provisioned states gracefully so that a role upgrade
+mid-provisioning does not leave BareMetalHost resources in an
+inconsistent state.
+
+## Version Skew Strategy
+
+The Metal3 role runs in AAP and interacts with BareMetalHost CRDs
+managed by the Bare Metal Operator (BMO) on the management cluster.
+The role must be compatible with the installed BMO version. The EE
+image should pin and test against specific BMO versions to avoid
+API incompatibilities.
+
+## Support Procedures
+
+- **ComputeInstance stuck in PENDING:** Check the AAP job output
+  for the `metal3_bm` role. Verify that matching hosts exist in
+  AAP inventory with `state: available` and correct `compute_instance_class`.
+  Check BareMetalHost CR status on the management cluster.
+- **BareMetalHost stuck in `provisioning`:** Check Ironic logs on
+  the management cluster. Common causes: unreachable BMC, invalid
+  image URL, network boot failure.
+
+## Infrastructure Needed [optional]
+
+- Metal3 / Ironic deployed on the management cluster

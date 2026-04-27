@@ -9,6 +9,9 @@ tracking-link:
 see-also:
   - enhancements/unified-compute-model/README.md
   - enhancements/carbide-integration/README.md
+  - enhancements/metal3-compute-backend/README.md
+  - enhancements/image-and-sshkey-resources/README.md
+  - https://github.com/osac-project/enhancement-proposals/pull/20 (Region/AZ)
 replaces:
 superseded-by:
 ---
@@ -177,24 +180,26 @@ A new role `osac.service.select_hosts` implements Phase 1:
 
 # Result:
 #   select_hosts_result:
-#     - { name: "host-01", site: "paris", nvlink_domain: "dom-3", ... }
-#     - { name: "host-02", site: "paris", nvlink_domain: "dom-3", ... }
-#     - { name: "host-03", site: "paris", nvlink_domain: "dom-3", ... }
-#     - { name: "host-04", site: "paris", nvlink_domain: "dom-3", ... }
+#     - { inventory_hostname: "host-01", site: "paris", nvlink_domain: "dom-3", ... }
+#     - { inventory_hostname: "host-02", site: "paris", nvlink_domain: "dom-3", ... }
+#     - { inventory_hostname: "host-03", site: "paris", nvlink_domain: "dom-3", ... }
+#     - { inventory_hostname: "host-04", site: "paris", nvlink_domain: "dom-3", ... }
 ```
 
 The role:
 
 1. Queries AAP inventory for hosts matching the class (by
-   `hostclass` group or host_var).
-2. Filters by region/site if specified.
+   `compute_instance_class` group or host_var).
+2. Filters by region/site if specified (region semantics defined
+   by the [Region/AZ EP](https://github.com/osac-project/enhancement-proposals/pull/20)).
 3. Filters by `state: available` (or equivalent host_var).
 4. Applies placement strategy (first-fit for `pack`, round-robin
    for `spread`, group-by for affinity).
-5. Acquires a distributed lock (K8s Lease, per hostclass) to
-   prevent race conditions — following the pattern from the removed
-   HostPool code.
-6. Returns the selected hosts as a list.
+5. Acquires a distributed lock via `osac.service.lease` (K8s Lease,
+   per compute_instance_class) to prevent race conditions. The lock is held in
+   a block/always pattern to guarantee release even on failure.
+6. Returns the selected hosts as a list of dicts, each containing
+   `inventory_hostname` and relevant host_vars.
 
 ### Inventory host_vars contract
 
@@ -203,7 +208,7 @@ have a minimum set of host_vars:
 
 | host_var | Type | Description | Set by |
 |---|---|---|---|
-| `hostclass` | string | ComputeInstanceClass this host can fulfill | Inventory plugin |
+| `compute_instance_class` | string | ComputeInstanceClass this host can fulfill | Inventory plugin |
 | `state` | string | `available`, `allocated`, `maintenance`, `error` | Inventory plugin + update role |
 | `site` | string | Site/location identifier | Inventory plugin |
 | `tenant` | string | Tenant ID (when allocated) | Update role |
@@ -214,7 +219,7 @@ Each inventory plugin maps its source data to these host_vars:
 
 | host_var | NetBox source | NICo source | OpenStack/Ironic source |
 |---|---|---|---|
-| `hostclass` | Custom field or DeviceType | InstanceType name | resource_class |
+| `compute_instance_class` | Custom field or DeviceType | InstanceType name | resource_class |
 | `state` | Device status | Machine status | provision_state |
 | `site` | Site name | Site name | — |
 | `tenant` | Tenant name | Tenant name | extra.tenant |
@@ -231,7 +236,7 @@ A new role `osac.service.update_host_state` implements Phase 3:
   ansible.builtin.include_role:
     name: osac.service.update_host_state
   vars:
-    update_host_names: "{{ select_hosts_result | map(attribute='name') }}"
+    update_host_names: "{{ select_hosts_result | map(attribute='inventory_hostname') | list }}"
     update_host_state: "allocated"
     update_host_tenant: "{{ tenant_id }}"
 ```
@@ -257,13 +262,21 @@ not query inventory themselves. The role interface:
 ```yaml
 # Variables received by the template role:
 compute_instance_hosts:            # list of selected hosts (from select_hosts)
-compute_instance_image:            # resolved Image (sourceType, sourceRef, bootMethod)
+compute_instance_image:            # resolved Image (sourceType, sourceRef, bootMethod, checksum)
 compute_instance_ssh_keys:         # list of resolved SSH public key strings
 compute_instance_subnet:           # subnet reference
 compute_instance_security_groups:  # list of security group references
 compute_instance_user_data:        # user data string
 compute_instance_class:            # ComputeInstanceClass (capabilities)
 ```
+
+**Reference resolution:** The `compute_instance_image` and
+`compute_instance_ssh_keys` variables contain **resolved data**,
+not name references. The fulfillment-service resolves `imageRef`
+and `sshKeyRefs` at ComputeInstance creation time and stores the
+results as `resolvedImage` and `resolvedSshKeys` on the private
+ComputeInstance record. The operator passes this resolved data to
+AAP — template roles never need to call the fulfillment API.
 
 The role's responsibility is solely to **provision** — create the
 backend resources (BareMetalHost, VirtualMachine, NICo Instance)
@@ -284,23 +297,24 @@ tasks:
       select_hosts_region: "{{ compute_instance.spec.region | default(omit) }}"
 
   # Phase 2: Provision (template-specific)
+  # Note: compute_instance_image and compute_instance_ssh_keys contain
+  # resolved data from the ComputeInstance's resolvedImage and resolvedSshKeys
+  # fields, populated by the fulfillment-service at creation time.
   - name: Provision compute instance
     ansible.builtin.include_role:
-      name: "{{ selected_template.roleCollection }}.{{ selected_template.role }}"
+      name: "{{ compute_instance_template_collection }}.{{ compute_instance_template_role }}"
       tasks_from: install.yaml
     vars:
       compute_instance_hosts: "{{ select_hosts_result }}"
-      compute_instance_image: "{{ resolved_image }}"
-      compute_instance_ssh_keys: "{{ resolved_ssh_keys }}"
 
   # Phase 3: Update inventory (shared, inventory-agnostic)
   - name: Update host state
     ansible.builtin.include_role:
       name: osac.service.update_host_state
     vars:
-      update_host_names: "{{ select_hosts_result | map(attribute='name') }}"
+      update_host_names: "{{ select_hosts_result | map(attribute='inventory_hostname') | list }}"
       update_host_state: "allocated"
-      update_host_tenant: "{{ tenant_id }}"
+      update_host_tenant: "{{ compute_instance_tenant | default('') }}"
 ```
 
 ### What changes for existing backends
@@ -321,7 +335,7 @@ type. With this separation, host selection uses
 `nvidia.bare_metal.bmm`). The NICo provisioning role (`nico_bm`)
 receives pre-selected hosts and attaches them to VPCs.
 
-### Implementation Details
+### Implementation Details/Notes/Constraints
 
 New roles in `osac.service`:
 - `select_hosts` — host selection with placement and locking
@@ -363,7 +377,7 @@ AAP inventory may be stale — a host marked `available` in
 inventory may have been allocated by another process.
 
 *Mitigation:* The distributed lock in `select_hosts` (K8s Lease
-per hostclass) serializes allocation decisions. The provisioning
+per compute_instance_class) serializes allocation decisions. The provisioning
 role validates that the host is still available before
 provisioning and fails fast if not.
 
@@ -373,7 +387,7 @@ provisioning and fails fast if not.
   for simple single-backend deployments.
 - Requires inventory plugins to conform to the host_vars contract.
 
-## Alternatives
+## Alternatives (Not Implemented)
 
 ### Keep inventory entangled with provisioning
 
@@ -392,6 +406,20 @@ hardware inventory data (GPUs, NVLink domains, rack positions).
 AAP inventory is the right place for this data, and Ansible is
 the right tool for querying and filtering it.
 
+## Open Questions [optional]
+
+1. **Lock granularity.** Should the distributed lock in
+   `select_hosts` be per-class or per-site-per-class?
+   Per-class is simpler but serializes all allocations for a
+   class across sites. Per-site-per-class allows parallel
+   allocation at different sites but increases lock management
+   complexity.
+
+2. **Dry-run mode.** Should `select_hosts` support a dry-run mode
+   that returns matching hosts without acquiring them? This would
+   enable capacity planning UIs without the risk of accidental
+   allocation.
+
 ## Test Plan
 
 TBD
@@ -399,3 +427,44 @@ TBD
 ## Graduation Criteria
 
 TBD
+
+## Upgrade / Downgrade Strategy
+
+The new `osac.service.select_hosts` and
+`osac.service.update_host_state` roles are added to the
+`osac.service` Ansible collection in the EE. Upgrading means
+deploying a new EE image with the updated collection. Existing
+template roles are refactored to stop querying inventory directly
+and instead receive pre-selected hosts — this is a breaking change
+for template role interfaces. All template roles must be updated
+in the same EE release.
+
+Downgrading means reverting to the previous EE image, which
+restores the old template role interfaces (direct inventory
+queries). This is safe as long as no new-style template roles
+were deployed.
+
+## Version Skew Strategy
+
+All components (select_hosts, update_host_state, template roles)
+run in the same AAP EE image. The EE image is atomic — there is
+no cross-component version skew within a single EE deployment.
+
+## Support Procedures
+
+- **Failed host selection:** Check AAP inventory for hosts matching
+  the requested `compute_instance_class`, `state: available`, and `site`/region.
+  Verify the dynamic inventory plugin is configured and synced.
+- **"Host not available" after selection:** The distributed lock
+  (K8s Lease) serializes allocation, but a host may have been
+  allocated by another process between selection and provisioning.
+  Check the AAP job output for lock acquisition and host state
+  verification errors.
+- **Inventory update failure:** If `update_host_state` fails, the
+  host may remain marked as `available` in inventory despite being
+  provisioned. Manually update the host state in the inventory
+  source (NetBox, NICo, or Ironic).
+
+## Infrastructure Needed [optional]
+
+None beyond existing OSAC infrastructure and AAP.
