@@ -7,6 +7,7 @@ last-updated: 2026-02-05
 tracking-link: # link to the tracking ticket (for example: Github issue) that corresponds to this enhancement
   - TBD
 see-also:
+  - enhancements/osac-addon/README.md
 replaces:
 superseded-by:
 ---

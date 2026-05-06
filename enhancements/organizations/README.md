@@ -7,6 +7,7 @@ last-updated: 2025-12-21
 tracking-link:
   - TBD
 see-also:
+  - enhancements/osac-addon/README.md
 replaces:
 superseded-by:
 ---

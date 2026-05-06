@@ -9,6 +9,7 @@ tracking-link:
 see-also:
   - "/enhancements/vmaas"
   - "/enhancements/bare-metal-fulfillment"
+  - enhancements/osac-addon/README.md
 replaces:
 superseded-by:
 ---

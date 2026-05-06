@@ -8,6 +8,8 @@ tracking-link:
   - https://redhat.atlassian.net/browse/MGMT-23669
 see-also:
   - "/enhancements/tenant-specific-storageclasses"
+  - enhancements/object-storage/README.md
+  - enhancements/osac-addon/README.md
 replaces:
 superseded-by:
 ---
@@ -47,6 +49,44 @@ workload needs fast SSD-backed storage, while the same tenant's archival VMs
 can use cheaper, slower storage. Without storage tiers, CSPs would need to
 either over-provision expensive storage for all workloads or maintain manual
 workarounds outside of OSAC.
+
+### Comparison with VMware Cloud Director Storage Policies
+
+VMware Cloud Director (VCD) implements storage tiering via vSphere Storage
+Policy-Based Management (SPBM). Providers tag datastores in vCenter (e.g.,
+"gold", "silver", "bronze"), create VM Storage Policies, and assign them to
+Provider VDCs. These appear as **storage profiles** in tenant Organization
+VDCs, with optional per-disk IOPS limits and per-entity-type restrictions.
+
+OSAC's label-based tier model is the Kubernetes-native equivalent:
+
+| Dimension | VCD Storage Policies | OSAC Storage Tiers |
+|---|---|---|
+| Definition | vSphere VM Storage Policies on tagged datastores | `osac.openshift.io/storage-tier` label on StorageClasses |
+| Scope | Assigned to Provider VDC → visible in Org VDC | Labeled per-tenant or shared (`Default`) |
+| Selection | User picks storage profile when creating VM/disk | Template or API field specifies tier name |
+| Resolution | Direct policy assignment | Label-based resolution with tenant → Default fallback |
+| IOPS limits | Per-disk IOPS limits on storage profile | Delegated to CSI driver QoS (e.g., NetApp, VAST) |
+| Backends | vSAN, VMFS, NFS datastores | ODF (Ceph RBD/CephFS), NetApp Trident, Pure Storage, Dell, VAST Data |
+
+For CSPs migrating from VCD, the mapping is straightforward: VCD storage
+profiles become OSAC storage tiers, with the same gold/silver/bronze
+semantics expressed as Kubernetes labels instead of vSphere tags.
+
+### Reference Implementation: OpenShift Data Foundation (ODF)
+
+ODF (Ceph-based) supports creating multiple storage pools with different
+device classes, each backing a separate StorageClass:
+
+* **NVMe pool** → `ocs-storagecluster-ceph-rbd-nvme` → labeled `tier: fast`
+* **SSD pool** → `ocs-storagecluster-ceph-rbd-ssd` → labeled `tier: standard`
+* **HDD pool (erasure-coded)** → `ocs-storagecluster-ceph-rbd-hdd` → labeled `tier: archival`
+
+Each Ceph pool has configurable replication factor, erasure coding profile,
+and device class. ODF creates StorageClass resources automatically for each
+pool. The OSAC admin labels them with `osac.openshift.io/storage-tier` and
+`osac.openshift.io/tenant`, and the resolution algorithm in this proposal
+handles the rest — no code changes required.
 
 ### User Stories
 
@@ -330,7 +370,7 @@ kind: ComputeInstance
 metadata:
   name: db-server-01
 spec:
-  templateID: osac.templates.database_vm
+  computeInstanceClass: database-vm
   cores: 4
   memoryGiB: 16
   bootDisk:
@@ -581,7 +621,7 @@ their specific tier names. To achieve this, OSAC-shipped templates use the
 conventional tier name `default`:
 
 ```yaml
-# Inside osac.templates.ocp_virt_vm/tasks/create.yaml (OSAC-shipped)
+# Inside osac.compute_kubevirt instance.create.main (OSAC-shipped)
 - name: Resolve boot disk StorageClass
   ansible.builtin.include_role:
     name: osac.service.tenant_storage_class
@@ -595,12 +635,11 @@ achieve this either by creating a tenant-specific StorageClass with
 StorageClass (`tenant: Default, storage-tier: default`) that serves as the
 fallback for all tenants without a dedicated one.
 
-CSPs that want specialized templates (e.g., a `database_vm` template that uses
-`fast` storage) customize or extend OSAC-shipped templates for their
-environment:
+CSPs that want specialized templates (e.g., a `database_vm` role that uses
+`fast` storage) customize in their provider collection:
 
 ```yaml
-# Inside a CSP-customized database_vm template
+# Inside a CSP-customized database_vm.create.main role
 - name: Resolve boot disk StorageClass
   ansible.builtin.include_role:
     name: osac.service.tenant_storage_class

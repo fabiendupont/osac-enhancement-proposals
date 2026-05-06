@@ -7,7 +7,8 @@ last-updated: 2025-09-15
 tracking-link:
   - None
 see-also:
-  - None
+  - enhancements/unified-compute-model/README.md
+  - enhancements/osac-addon/README.md
 replaces:
   - None
 superseded-by:

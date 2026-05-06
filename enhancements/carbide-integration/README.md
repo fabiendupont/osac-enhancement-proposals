@@ -7,6 +7,7 @@ last-updated: 2026-03-09
 tracking-link: # link to the tracking ticket (for example: Github issue) that corresponds to this enhancement
   - None
 see-also:
+  - enhancements/osac-addon/README.md
   - enhancements/bare-metal-fulfillment/README.md
 replaces:
   - None

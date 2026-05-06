@@ -8,6 +8,7 @@ tracking-link:
   - TBD
 see-also:
   - enhancements/unified-compute-model/README.md
+  - enhancements/osac-addon/README.md
   - enhancements/inventory-provisioning-separation/README.md
   - enhancements/image-and-sshkey-resources/README.md
   - enhancements/carbide-integration/README.md
@@ -74,8 +75,9 @@ OpenShift bare-metal IPI installations.
 
 ### Goals
 
-- Implement a Metal3 ComputeInstanceTemplate as an Ansible role in
-  `osac.templates`.
+- Implement a Metal3 compute provider collection
+  (`osac.compute_metal3`) following the
+  [OSAC Add-On convention](../osac-addon/README.md).
 - Support RHEL (image-mode/bootc) and RHCOS images via Metal3.
 - Follow the inventory/provisioning separation pattern from the
   [inventory-provisioning-separation](../inventory-provisioning-separation/README.md)
@@ -99,8 +101,7 @@ OpenShift bare-metal IPI installations.
 id: "metal3-b200-paris"
 backend: "metal3"
 site: "paris"
-role: "metal3_bm"
-roleCollection: "osac.templates"
+collection: "osac.compute_metal3"
 ```
 
 The `site` field maps to the Region/AZ topology defined in the
@@ -109,12 +110,14 @@ A ComputeInstanceClass references one template per site, enabling
 multi-site deployments where the same class is available at
 different locations.
 
-The template role `osac.templates.metal3_bm` implements three
-entry points: `install.yaml`, `delete.yaml`, and `status.yaml`.
+The `osac.compute_metal3` collection implements ResourceAction
+roles: `instance.create.main`, `instance.delete.main`, and
+`instance.signal.main`.
 
-### Provisioning workflow (install.yaml)
+### Provisioning workflow (instance.create.main)
 
-The role receives pre-selected hosts from `osac.service.select_hosts`
+The role receives pre-selected hosts from
+`osac.service.select_hosts`
 (per the inventory/provisioning separation EP).
 
 ```
@@ -197,16 +200,18 @@ EE:
 EE: osac-core (base — shared by all backends)
   ├── kubernetes.core, community.general, ansible.utils
   ├── ansible.controller, ansible.eda
-  └── osac.service, osac.templates, osac.workflows
+  └── osac.service, osac.service
 
 EE: osac-metal3 (this backend)
   └── FROM osac-core
+      └── osac.compute_metal3
 ```
 
 Inventory plugin collections (e.g., `netbox.netbox`) belong in
-the AAP inventory configuration, not in the template role's EE —
-the template role receives pre-selected hosts from
-`osac.service.select_hosts` and never queries inventory directly.
+the AAP inventory configuration, not in the provider role's EE —
+the role receives pre-selected hosts from
+`osac.service.select_hosts` and never queries
+inventory directly.
 
 GPU fabric collections (`nvidia.nmx`, `nvidia.ufm`) belong in
 the EE of the network provider that handles NVLink/IB isolation,

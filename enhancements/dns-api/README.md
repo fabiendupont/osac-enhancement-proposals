@@ -8,6 +8,9 @@ tracking-link:
   - TBD
 see-also:
   - "/enhancements/networking"
+  - enhancements/osac-addon/README.md
+  - enhancements/vpn-service/README.md
+  - enhancements/load-balancer-service/README.md
 replaces:
   - N/A
 superseded-by:
@@ -57,19 +60,21 @@ need DNS record management.
 
 ### Goals
 
-- Introduce a DNS dispatcher role (`osac.service.dns`) in the `osac.service`
-  Ansible collection that provides a uniform interface for creating and
-  deleting DNS records, dispatching to pluggable driver roles.
-- Implement an initial set of DNS driver roles: `osac.service.dns_route53`
-  (existing behavior), `osac.service.dns_rfc2136` (for self-hosted DNS
-  servers like BIND or PowerDNS), and additional drivers as needed (e.g.,
-  `osac.service.dns_cloudflare` or `osac.service.dns_azure`).
-- Enable third-party organizations to create custom DNS driver roles in
-  their own Ansible collections without modifying OSAC code.
-- Refactor all roles that currently call `amazon.aws.route53` directly
-  to use the new DNS abstraction.
-- Allow deployers to select their DNS provider via configuration
-  (group_vars/extra vars) without modifying roles or playbooks.
+- Introduce per-provider DNS collections following the
+  [OSAC Add-On convention](../osac-addon/README.md):
+  `osac.dns_route53` (existing behavior),
+  `osac.dns_rfc2136` (for self-hosted DNS servers like BIND
+  or PowerDNS), and additional providers as needed (e.g.,
+  `osac.dns_cloudflare`, `osac.dns_azure`).
+- Enable third-party organizations to create custom DNS provider
+  collections in their own namespace (e.g.,
+  `myorg.osac_dns`) without modifying OSAC code.
+- Refactor all roles that currently call `amazon.aws.route53`
+  directly to use the new DNS abstraction via provider
+  collections.
+- Allow deployers to select their DNS provider via a DnsClass
+  resource that references the provider collection, without
+  modifying roles or playbooks.
 
 ### Non-Goals
 
@@ -87,18 +92,20 @@ need DNS record management.
 
 ## Proposal
 
-This proposal introduces a new Ansible role `osac.service.dns` that provides a
-uniform interface for DNS record management. The role dispatches to
-class-specific driver roles based on a configurable `dns_class` variable,
-following the same pattern as NetworkClass in the Networking API. Each DNS class
-implementation is a separate Ansible role (e.g., `osac.service.dns_route53`,
-`osac.service.dns_cloudflare`), and the `dns_class` variable holds the
-fully-qualified role name used for dispatch. This design allows third-party
-organizations to create their own DNS driver roles (e.g.,
-`myorg.mycollection.custom_dns`) without modifying any OSAC code.
+This proposal introduces per-provider DNS Ansible collections following the
+[OSAC Add-On convention](../osac-addon/README.md). Each DNS provider ships its
+own collection (e.g., `osac.dns_route53`, `osac.dns_cloudflare`) with
+ResourceAction roles (`record.create.main`, `record.delete.main`). A `DnsClass`
+resource references the provider collection, and the operator dispatches to it
+— no dispatcher role needed. This follows the collection-per-provider model
+where each collection is self-contained and independently versioned.
 
-All roles that currently manage DNS records will call `osac.service.dns` instead of directly invoking
-backend-specific modules.
+Third-party organizations create their own DNS provider collections
+(e.g., `myorg.osac_dns`) without modifying OSAC code.
+
+All roles that currently manage DNS records will use the provider collection
+referenced by the DnsClass instead of directly invoking backend-specific
+modules.
 
 ### Workflow Description
 
@@ -107,13 +114,13 @@ backend-specific modules.
 **OSAC template developer** is a developer creating or modifying Ansible
 templates for cluster or VM provisioning.
 
-#### Deployer Configures DNS Class
+#### Deployer Configures DNS Provider
 
-1. The deployer sets `dns_class` in their environment's group_vars or extra
-   vars (e.g., `dns_class: osac.service.dns_route53`).
-2. The deployer provides class-specific configuration variables. Each class
-   manages its own backend-specific details (e.g., zone, credentials) so that
-   callers of the DNS role don't need to know about them.
+1. The deployer creates a `DnsClass` resource referencing the provider
+   collection (e.g., `collection: osac.dns_route53`).
+2. The deployer provides provider-specific configuration variables. Each
+   provider collection manages its own backend-specific details (e.g., zone,
+   credentials) so that callers don't need to know about them.
 3. The deployer provides credentials through standard Kubernetes/OpenShift
    mechanisms (e.g., Secrets), which are then made available to the automation
    layer.
@@ -123,166 +130,114 @@ templates for cluster or VM provisioning.
 1. The external access role determines the DNS records needed (API,
    API-internal, wildcard ingress).
 2. Instead of calling `amazon.aws.route53` directly, it includes the
-   `osac.service.dns` role with `tasks_from: create` and the record details.
-3. The `osac.service.dns` role reads `dns_class` and dispatches to the
-   appropriate driver role (e.g., `osac.service.dns_route53`,
-   `osac.service.dns_cloudflare`, or a third-party role like
-   `myorg.mycollection.custom_dns`).
-4. The driver role creates the DNS record using the appropriate Ansible
+   `record.create.main` role from the DnsClass's provider collection.
+3. The provider role creates the DNS record using the appropriate Ansible
    module.
-5. The existing `wait_for_dns` role verifies DNS propagation (unchanged).
+4. The existing `wait_for_dns` role verifies DNS propagation (unchanged).
 
 #### Cluster Deletion Removes DNS Records
 
-1. The external access role's destroy tasks include the `osac.service.dns`
-   role with `tasks_from: delete` and the record names.
-2. The DNS role dispatches to the appropriate class and deletes the records.
+1. The external access role's destroy tasks include the `record.delete.main`
+   role from the DnsClass's provider collection.
+2. The provider role deletes the records.
 
 ### API Extensions
 
-This enhancement does not introduce new CRDs or modify the Fulfillment API. It
-is scoped to the internal Ansible automation layer.
+This enhancement introduces a `DnsClass` resource (private API, provider-
+defined) that references the DNS provider collection. It does not modify the
+tenant-facing Fulfillment API.
 
 ### Implementation Details/Notes/Constraints
 
-#### New Role: `osac.service.dns` (Dispatcher)
+#### Provider Collections (per-provider, no dispatcher)
 
-The `osac.service.dns` dispatcher role will live in the `osac.service` Ansible
-collection at:
-
-```text
-collections/ansible_collections/osac/service/roles/dns/
-  meta/
-    argument_specs.yaml
-  defaults/
-    main.yaml
-  tasks/
-    main.yaml
-    create.yaml
-    delete.yaml
-```
-
-The role's `defaults/main.yaml` sets the default DNS class to Route 53 for
-backward compatibility:
-
-```yaml
-# defaults/main.yaml
-dns_class: osac.service.dns_route53
-```
-
-Each DNS driver is a separate role with `create.yaml` and `delete.yaml`
-entrypoints:
+Following the [OSAC Add-On convention](../osac-addon/README.md),
+each DNS provider ships its own collection with ResourceAction
+roles:
 
 ```text
-collections/ansible_collections/osac/service/roles/dns_route53/
+osac.dns_route53/
   meta/
-    argument_specs.yaml
-  tasks/
-    create.yaml
-    delete.yaml
+    addon.yaml
+  roles/
+    record.create.main/
+      meta/osac.yaml
+      tasks/main.yml
+    record.delete.main/
+      meta/osac.yaml
+      tasks/main.yml
 
-collections/ansible_collections/osac/service/roles/dns_cloudflare/
-  meta/
-    argument_specs.yaml
-  tasks/
-    create.yaml
-    delete.yaml
+osac.dns_cloudflare/
+  roles/
+    record.create.main/
+      meta/osac.yaml
+      tasks/main.yml
+    record.delete.main/
+      meta/osac.yaml
+      tasks/main.yml
 
-collections/ansible_collections/osac/service/roles/dns_rfc2136/
-  meta/
-    argument_specs.yaml
-  tasks/
-    create.yaml
-    delete.yaml
+osac.dns_rfc2136/
+  roles/
+    record.create.main/
+      meta/osac.yaml
+      tasks/main.yml
+    record.delete.main/
+      meta/osac.yaml
+      tasks/main.yml
 ```
 
-Third-party organizations can create their own driver roles in their own
-collections (e.g., `myorg.mycollection.custom_dns`) following the same
-interface, without modifying any OSAC code.
+Third-party organizations create their own provider collections
+(e.g., `myorg.osac_dns`) following the same convention,
+without modifying any OSAC code.
 
-#### Dispatcher Role Interface (argument_specs)
+The default DnsClass uses `osac.dns_route53` for backward
+compatibility.
+
+#### Role I/O Contract (meta/osac.yaml)
+
+Each provider collection's `record.create.main` role declares
+its contract in `meta/osac.yaml` following the OSAC Add-On
+convention:
 
 ```yaml
-argument_specs:
-  create:
-    short_description: Create a DNS record
-    options:
-      dns_class:
-        type: str
-        required: false
-        default: osac.service.dns_route53
-        description: >
-          Fully-qualified Ansible role name of the DNS driver to use
-          (e.g., osac.service.dns_route53, osac.service.dns_cloudflare,
-          or a third-party role like myorg.mycollection.custom_dns).
-          Defaults to Route 53 for backward compatibility.
-          Follows the same pattern as NetworkClass in the Networking API.
-      dns_record_name:
-        type: str
-        required: true
-        description: Fully qualified domain name for the record.
-      dns_record_type:
-        type: str
-        required: false
-        default: A
-        choices: [A, AAAA]
-        description: >
-          DNS record type. A for IPv4 addresses, AAAA for IPv6 addresses.
-      dns_record_value:
-        type: str
-        required: true
-        description: >
-          The value for the record (e.g., an IPv4 address for A records,
-          an IPv6 address for AAAA records).
-      dns_record_ttl:
-        type: int
-        default: 1800
-        description: TTL in seconds.
-      dns_record_overwrite:
-        type: bool
-        default: true
-        description: Whether to overwrite an existing record.
-  delete:
-    short_description: Delete a DNS record
-    options:
-      dns_class:
-        type: str
-        required: false
-        default: osac.service.dns_route53
-        description: >
-          Fully-qualified Ansible role name of the DNS driver to use.
-          Defaults to Route 53 for backward compatibility.
-      dns_record_name:
-        type: str
-        required: true
-      dns_record_type:
-        type: str
-        required: false
-        default: A
-        choices: [A, AAAA]
+# osac.dns_route53/roles/record.create.main/meta/osac.yaml
+resource_type: DnsRecord
+event: Create
+phase: main
+priority: 100
+failure_policy: Fail
+
+parameters:
+  - name: dns_record_name
+    type: string
+    required: true
+    description: Fully qualified domain name for the record
+  - name: dns_record_type
+    type: string
+    required: false
+    default: A
+    description: "DNS record type: A or AAAA"
+  - name: dns_record_value
+    type: string
+    required: true
+    description: The value for the record (IP address)
+  - name: dns_record_ttl
+    type: integer
+    required: false
+    default: 1800
+    description: TTL in seconds
+  - name: dns_record_overwrite
+    type: boolean
+    required: false
+    default: true
+
+outputs:
+  - name: record_id
+    type: string
+    description: Created record identifier
 ```
 
-#### DNS Class Dispatch (tasks/create.yaml)
-
-```yaml
----
-- name: Create DNS record via {{ dns_class }}
-  ansible.builtin.include_role:
-    name: "{{ dns_class }}"
-    tasks_from: create
-```
-
-#### DNS Class Dispatch (tasks/delete.yaml)
-
-```yaml
----
-- name: Delete DNS record via {{ dns_class }}
-  ansible.builtin.include_role:
-    name: "{{ dns_class }}"
-    tasks_from: delete
-```
-
-#### Route 53 Driver Role (`osac.service.dns_route53/tasks/create.yaml`)
+#### Route 53 Provider (`osac.dns_route53`)
 
 ```yaml
 ---
@@ -298,7 +253,7 @@ argument_specs:
     overwrite: "{{ dns_record_overwrite | default(true) }}"
 ```
 
-#### Cloudflare Driver Role (`osac.service.dns_cloudflare/tasks/create.yaml`)
+#### Cloudflare Provider (`osac.dns_cloudflare`)
 
 ```yaml
 ---
@@ -314,7 +269,7 @@ argument_specs:
     solo: "{{ dns_record_overwrite | default(true) }}"
 ```
 
-#### RFC 2136 Driver Role (`osac.service.dns_rfc2136/tasks/create.yaml`)
+#### RFC 2136 Provider (`osac.dns_rfc2136`)
 
 ```yaml
 ---
@@ -333,15 +288,14 @@ argument_specs:
     key_algorithm: "{{ dns_rfc2136_key_algorithm | default('hmac-sha256') }}"
 ```
 
-#### Custom Third-Party Driver
+#### Custom Third-Party Provider
 
-Any organization can create a custom DNS driver role in their own Ansible
-collection. The role must implement `create.yaml` and `delete.yaml` task
-entrypoints that accept the standard DNS role variables (`dns_record_name`,
-`dns_record_type`, `dns_record_value`, `dns_record_ttl`,
-`dns_record_overwrite`). For example, a role at
-`myorg.mycollection.custom_dns` can be used by setting
-`dns_class: myorg.mycollection.custom_dns`.
+Any organization can create a custom DNS provider collection in
+their own namespace (e.g., `myorg.osac_dns`). The collection
+must contain `record.create.main` and `record.delete.main` roles
+with `meta/osac.yaml` declaring the standard DNS parameters and
+outputs. The deployer creates a DnsClass referencing
+`collection: myorg.osac_dns`.
 
 #### Refactored external access roles (create example)
 
@@ -372,11 +326,10 @@ follow the same pattern. example:
 Would become:
 
 ```yaml
-# After (class-agnostic):
+# After (provider-agnostic via DnsClass collection):
 - name: Create dns records
   ansible.builtin.include_role:
-    name: osac.service.dns
-    tasks_from: create
+    name: "{{ dns_class_collection }}.record.create.main"
   vars:
     dns_record_name: "{{ item.name }}"
     dns_record_type: A
@@ -391,33 +344,19 @@ Would become:
       addr: "{{ netris_l4lb_ingress_ip }}"
 ```
 
+Where `dns_class_collection` is resolved from the DnsClass
+resource's `collection` field (e.g., `osac.dns_route53`).
+
 #### Refactored external access roles (destroy example)
 
-Similarly, the delete tasks in both roles would change from:
-
-```yaml
-# Before:
-- name: Delete dns records
-  amazon.aws.route53:
-    state: absent
-    zone: "{{ external_access_base_domain }}"
-    record: "{{ item }}"
-    type: A
-    wait: true
-  loop:
-    - "api.{{ external_access_name }}.{{ external_access_base_domain }}"
-    - "api-int.{{ external_access_name }}.{{ external_access_base_domain }}"
-    - "*.apps.{{ external_access_name }}.{{ external_access_base_domain }}"
-```
-
-To:
+Similarly, the delete tasks would change from direct Route 53
+calls to:
 
 ```yaml
 # After:
 - name: Delete dns records
   ansible.builtin.include_role:
-    name: osac.service.dns
-    tasks_from: delete
+    name: "{{ dns_class_collection }}.record.delete.main"
   vars:
     dns_record_name: "{{ item }}"
     dns_record_type: A
@@ -434,8 +373,8 @@ Deployers configure their DNS class in group_vars:
 ```yaml
 # group_vars/all/dns.yaml
 
-# DNS class selection (fully-qualified role name of the driver)
-dns_class: osac.service.dns_route53  # or: osac.service.dns_cloudflare, myorg.mycollection.custom_dns
+# DNS provider is configured via DnsClass resource (collection field)
+# Default DnsClass references osac.dns_route53
 
 # Route 53 class-specific configuration
 # dns_route53_zone: "example.com"
@@ -454,34 +393,34 @@ dns_class: osac.service.dns_route53  # or: osac.service.dns_cloudflare, myorg.my
 # dns_rfc2136_key_algorithm: "hmac-sha256"
 ```
 
-#### Adding a New DNS Class
+#### Adding a New DNS Provider
 
-To add support for a new DNS class (e.g., Azure DNS):
+To add support for a new DNS provider (e.g., Azure DNS):
 
-1. Create a new role (e.g., `osac.service.dns_azure`) with `create.yaml` and
-   `delete.yaml` task entrypoints that accept the standard DNS role variables.
-2. Implement the create/delete logic using the appropriate Ansible module
-   (e.g., `azure.azcollection.azure_rm_dnsrecordset`).
-3. Add any required class-specific variables to the role's `argument_specs.yaml`
-   and document them.
-4. Add the required Ansible collection to `collections/requirements.yml` if not
-   already present.
+1. Create a new collection (e.g., `osac.dns_azure`) with
+   `record.create.main` and `record.delete.main` roles following
+   the [OSAC Add-On convention](../osac-addon/README.md).
+2. Add `meta/osac.yaml` to each role declaring the standard DNS
+   parameters and outputs.
+3. Implement the create/delete logic using the appropriate
+   Ansible module (e.g., `azure.azcollection.azure_rm_dnsrecordset`).
+4. Validate with `osac addon lint osac.dns_azure`.
+5. Publish the collection to Automation Hub.
+6. Create a DnsClass resource referencing
+   `collection: osac.dns_azure`.
 
-Third-party organizations can follow the same steps to create a driver role in
-their own Ansible collection, without modifying any OSAC code. The deployer
-simply sets `dns_class` to the fully-qualified role name.
+Third-party organizations follow the same steps in their own
+namespace (e.g., `myorg.osac_dns`).
 
-#### Collection Dependencies
+#### Provider Collections
 
-Each DNS class may require its own Ansible collection:
-
-| DNS Class  | Ansible Collection       | Already Vendored |
-|------------|--------------------------|------------------|
-| route53    | `amazon.aws`             | Yes              |
-| cloudflare | `community.general`      | Yes              |
-| rfc2136    | `community.general`      | Yes              |
-| azure_dns  | `azure.azcollection`     | No               |
-| gcp_dns    | `google.cloud`           | No               |
+| Provider | Collection | Ansible Dependency |
+|----------|-----------|-------------------|
+| Route 53 | `osac.dns_route53` | `amazon.aws` |
+| Cloudflare | `osac.dns_cloudflare` | `community.general` |
+| RFC 2136 | `osac.dns_rfc2136` | `community.general` |
+| Azure DNS | `osac.dns_azure` | `azure.azcollection` |
+| GCP DNS | `osac.dns_gcp` | `google.cloud` |
 
 ### Risks and Mitigations
 
@@ -490,16 +429,15 @@ Each DNS class may require its own Ansible collection:
 | Class module API differences | Different modules have different parameters and behaviors (e.g., Cloudflare uses `solo` vs Route 53 uses `overwrite`) | Abstract differences inside each driver role; expose only the common interface |
 | Credential management varies per provider | Each DNS provider uses different authentication mechanisms | Document credential setup per provider; manage credentials via Kubernetes Secrets |
 | Wildcard record support | Not all DNS backends handle wildcard DNS records identically | Test wildcard record creation/deletion for each supported class before release |
-| Breaking existing deployments | Deployers currently using Route 53 implicitly | Default `dns_class` to `osac.service.dns_route53` so existing deployments work without config changes |
+| Breaking existing deployments | Deployers currently using Route 53 implicitly | Default DnsClass references `osac.dns_route53` so existing deployments work without config changes |
 
 ### Drawbacks
 
 - Adds a layer of indirection for DNS operations. Debugging DNS issues now
-  requires understanding which DNS class is configured and how the dispatch
-  works.
-- Each new DNS class requires implementing and maintaining a driver role,
-  adding to the maintenance surface (though third-party drivers are maintained
-  externally).
+  requires understanding which DnsClass and provider collection is configured.
+- Each new DNS provider requires implementing and maintaining a collection,
+  adding to the maintenance surface (though partner collections are maintained
+  independently).
 - Backend-specific features (e.g., Route 53 health checks, Cloudflare
   proxying) are not exposed through the common interface. Deployers who need
   these features would need to extend the driver roles.
@@ -517,18 +455,16 @@ Adding it to the Fulfillment Service would introduce unnecessary complexity and
 API surface for what is essentially an infrastructure-side operation. This alternative
 could be revisited if tenant-facing DNS management becomes a requirement.
 
-### Alternative 2: Task Files Within a Single Role (no separate driver roles)
+### Alternative 2: Task Files Within a Single Role (no separate collections)
 
-Instead of separate driver roles, implement each DNS class as a task file
-within the `osac.service.dns` role (e.g., `class_route53.yaml`,
-`class_cloudflare.yaml`) and dispatch via `include_tasks`.
+Instead of separate collections per provider, implement each DNS backend as
+task files within a single collection and dispatch via `include_tasks`.
 
-**Why not selected**: This approach requires modifying the `osac.service.dns`
-role for every new DNS provider. By using separate driver roles, third-party
-organizations can create their own DNS drivers (e.g.,
-`myorg.mycollection.custom_dns`) without modifying any OSAC code. The
-dispatcher role still centralizes class selection, so callers do not need
-conditional logic.
+**Why not selected**: This approach requires modifying the shared collection
+for every new DNS provider. With collection-per-provider (following the
+[OSAC Add-On convention](../osac-addon/README.md)), third-party organizations
+create their own collections (e.g., `myorg.osac_dns`) with independent
+lifecycle and versioning.
 
 ## Open Questions
 
@@ -548,37 +484,35 @@ conditional logic.
 
 *Section not required until targeted at a release.*
 
-- **Unit tests**: Validate DNS class dispatch logic (correct driver role
-  included based on `dns_class` value; error on unsupported class).
-- **Integration tests**: For each supported DNS class, test create and delete
+- **Lint tests**: Validate each provider collection with `osac addon lint`.
+- **Integration tests**: For each provider collection, test create and delete
   of A and AAAA records, including wildcard records, against a
   real DNS zone in a CI environment.
 - **Migration test**: Verify that existing deployments using Route 53 continue
-  to work with `dns_class: osac.service.dns_route53` (default) without any
+  to work with default DnsClass referencing `osac.dns_route53` without any
   configuration changes.
 
 ## Graduation Criteria
 
 *Section not required until targeted at a release.*
 
-- **Dev Preview**: Route 53 DNS class working through the new abstraction;
-  relevant roles refactored to use
-  `osac.service.dns`.
-- **Tech Preview**: At least one additional DNS class implemented and tested;
-  documentation for adding new DNS classes.
-- **GA**: All supported DNS classes documented and tested; migration guide
+- **Dev Preview**: `osac.dns_route53` collection working; relevant roles
+  refactored to use provider collection dispatch.
+- **Tech Preview**: At least one additional provider collection implemented;
+  documentation for creating new DNS provider collections.
+- **GA**: All supported providers documented and tested; migration guide
   published.
 
 ## Upgrade / Downgrade Strategy
 
-- Existing deployments that do not set `dns_class` will default to
-  `osac.service.dns_route53`, preserving current behavior with no changes
+- Existing deployments will use a default DnsClass referencing
+  `osac.dns_route53`, preserving current behavior with no changes
   required.
-- Both relevant roles will be updated
-  to use the new DNS role. Since this is an internal implementation change, it
-  does not affect the external API or CRDs.
-- Downgrade: reverting to a previous version of the `osac.service` collection
-  restores the hardcoded Route 53 behavior.
+- Both relevant roles will be updated to use the provider collection
+  dispatch. Since this is an internal implementation change, it does not
+  affect the external API or CRDs.
+- Downgrade: reverting to a previous version restores the hardcoded
+  Route 53 behavior.
 
 ## Version Skew Strategy
 

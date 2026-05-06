@@ -7,6 +7,7 @@ last-updated: 2026-02-05
 tracking-link:
   - TBD
 see-also:
+  - enhancements/osac-addon/README.md
 replaces:
   - "[ComputeInstance-VM_PhasesAndConditions_Proposal (Google Doc)](https://docs.google.com/document/d/1wgqAblnT7OHlT5bvaI4bi842kyeR3u4VfC_TAJXbGcI/edit?usp=sharing)"
 superseded-by:

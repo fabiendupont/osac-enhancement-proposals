@@ -6,6 +6,11 @@ creation-date: 2026-01-12
 last-updated: 2026-04-25
 tracking-link: # link to the tracking ticket (for example: Github issue) that corresponds to this enhancement
 see-also:
+  - enhancements/unified-compute-model/README.md
+  - enhancements/inventory-provisioning-separation/README.md
+  - enhancements/cost-metric-mapping/README.md
+  - enhancements/composable-catalog-items/README.md
+  - enhancements/osac-addon/README.md
 replaces:
 superseded-by:
 ---
@@ -58,15 +63,21 @@ don't have the ability to add or modify ansible roles.
 ## Proposal
 
 ComputeInstanceTemplate and ClusterTemplate continue to be auto-populated by the
-system based on discovered ansible roles. But they will no longer be directly
-usable by tenant users.
+system based on discovered Ansible roles. As described in the
+[OSAC Add-On EP](../osac-addon/README.md), Templates are converging with
+ResourceActions — each provider's Ansible collection
+(e.g., `osac.compute_kubevirt`, `osac.kubernetes_hcp`) contains roles
+following the ResourceAction naming convention, with parameter definitions in
+`meta/osac.yaml`. Templates will no longer be directly usable by tenant users.
 
 New APIs called ClusterCatalogItem and ComputeInstanceCatalogItem will be
 created. Both will have similar properties, so we'll use Cluster as an example:
 
 ClusterCatalogItem
-* references an existing ClusterTemplate by ID
-* includes a list of field definitions, each of which specifies a field by dot-notation path, whether it is editable by the user, an optional default value, and an optional JSON Schema validation rule
+* references a provider collection and role (ResourceAction) — during the
+  migration period, this may still reference a Template by ID for backward
+  compatibility
+* includes a list of field definitions, each of which specifies a field by dot-notation path, whether it is editable by the user, an optional default value, and an optional JSON Schema validation rule. These field definitions wrap the ResourceAction's `parameters` from `meta/osac.yaml`
 * includes a new selector field `published` that takes values TRUE and FALSE
 * includes a tenant identifier that defines which tenant this CatalogItem is visible to. Defaults to all tenants if not set.
 

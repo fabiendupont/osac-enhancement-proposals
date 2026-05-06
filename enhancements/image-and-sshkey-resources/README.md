@@ -8,6 +8,7 @@ tracking-link:
   - TBD
 see-also:
   - enhancements/unified-compute-model/README.md
+  - enhancements/osac-addon/README.md
   - enhancements/vm-api-fields/README.md
   - enhancements/metal3-compute-backend/README.md
   - enhancements/inventory-provisioning-separation/README.md

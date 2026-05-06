@@ -15,6 +15,9 @@ see-also:
   - enhancements/metal3-compute-backend/README.md
   - enhancements/inventory-provisioning-separation/README.md
   - enhancements/catalog-items/README.md
+  - enhancements/cost-metric-mapping/README.md
+  - enhancements/composable-catalog-items/README.md
+  - enhancements/osac-addon/README.md
   - https://github.com/osac-project/enhancement-proposals/pull/20 (Region/AZ)
   - https://github.com/osac-project/enhancement-proposals/pull/35 (VM Image Management)
 replaces:
@@ -250,49 +253,56 @@ locations.
 #### ComputeInstanceTemplate (provider-defined, internal)
 
 A ComputeInstanceTemplate is an Ansible role that implements the
-provisioning logic for a specific backend and site. It follows the
-existing OSAC pattern where Templates are Ansible roles.
+provisioning logic for a specific backend and site. Each backend
+has its own Ansible collection following the
+[OSAC Add-On convention](../osac-addon/README.md):
+
+| Backend | Collection |
+|---|---|
+| KubeVirt | `osac.compute_kubevirt` |
+| Metal3 | `osac.compute_metal3` |
+| NICo | `osac.compute_nico` |
 
 ComputeInstanceTemplates are not visible to tenants. They are
 registered in the fulfillment-service database and referenced by
-ComputeInstanceClasses.
+ComputeInstanceClasses via the `collection` field.
 
 ```yaml
 id: "metal3-b200-paris"
 backend: "metal3"
 site: "paris"
-role: "metal3_bm_rhel"
-roleCollection: "osac.templates"
+collection: "osac.compute_metal3"
 ```
 
 ```yaml
 id: "kubevirt-a100-paris"
 backend: "kubevirt"
 site: "paris"
-role: "ocp_virt_vm"
-roleCollection: "osac.templates"
+collection: "osac.compute_kubevirt"
 ```
 
 ```yaml
 id: "nico-b200-paris"
 backend: "nico"
 site: "paris"
-role: "nico_bm"
-roleCollection: "osac.templates"
+collection: "osac.compute_nico"
 ```
 
-The template role receives standardized variables from the
+The provisioning role receives standardized variables from the
 ComputeInstance spec (image, sshKeys, subnet, securityGroups,
 userData, cores, memoryGiB) plus class-level context (capabilities,
 site). The role is responsible for translating these into
 backend-specific operations.
 
-Template roles must implement three entry points:
-- `install.yaml` — provision the compute instance
-- `delete.yaml` — deprovision and clean up
-- `status.yaml` — report current state (optional)
+Each provider collection implements ResourceAction roles
+following the naming convention from the
+[OSAC Add-On EP](../osac-addon/README.md):
+- `instance.create.main` — provision the compute instance
+- `instance.delete.main` — deprovision and clean up
+- `instance.signal.main` — report current state
 
-This aligns with the existing ClusterTemplate pattern.
+These replace the previous `install.yaml`/`delete.yaml`/
+`status.yaml` entry points.
 
 #### ComputeInstance (tenant-created)
 
@@ -322,6 +332,10 @@ spec:
   additionalDisks:
     - sizeGiB: 250
   runStrategy: "Always"
+  # Power and console (both VM and bare-metal classes):
+  powerState: "On"
+  consoleAccess:
+    serialConsole: true
   # Server-populated (read-only):
   resolvedImage:
     sourceType: "registry"
@@ -333,6 +347,10 @@ spec:
 status:
   state: "RUNNING"
   ipAddress: "10.100.0.10"
+  powerState: "On"
+  consoleAccess:
+    serialConsole: true
+    serialConsoleURL: "wss://console.osac.dog8.cloud/..."
   conditions: [...]
 ```
 
@@ -359,6 +377,126 @@ EPs are preserved. The changes are:
   has all data without API callbacks
 - `resolvedSshKeys` is populated by the server at creation time —
   the actual public key strings resolved from the SSHKey resources
+
+##### Unified image format resolution
+
+A key benefit of the unified compute model is that tenants use
+the same `imageRef` regardless of whether the target is a VM or
+bare-metal machine. The Image resource
+([image-and-sshkey-resources EP](../image-and-sshkey-resources/README.md))
+is format-agnostic at the tenant level — the tenant sees
+"RHEL 9.6 GPU" and the system resolves it to the correct format
+for the backend.
+
+An Image resource can declare multiple sources with different
+formats:
+
+```yaml
+id: "rhel-9.6-gpu"
+title: "RHEL 9.6 with GPU drivers"
+sources:
+  - format: "qcow2"
+    sourceType: "registry"
+    sourceRef: "quay.io/osac/rhel:9.6-gpu"
+    bootMethod: "cloud-init"
+    checksum: "sha256:abc123..."
+  - format: "iso"
+    sourceType: "http"
+    sourceRef: "https://images.osac.io/rhel-9.6-gpu.iso"
+    bootMethod: "kickstart"
+    checksum: "sha256:def456..."
+```
+
+QCOW2 is the universal image format — it works for both VM and
+bare-metal provisioning:
+
+| Backend | How QCOW2 is consumed |
+|---|---|
+| KubeVirt | `DataVolume` pulls QCOW2 from registry, writes to PV, boots VM |
+| Metal3/Ironic | Ironic Python Agent (IPA) writes QCOW2 to disk via `qemu-img convert qcow2 raw` during deploy |
+| NICo | NICo API receives image reference, handles internally |
+| ESI | OpenStack Glance stores QCOW2, Ironic deploys to node |
+
+For bare-metal nodes booting from remote OS disk (iSCSI,
+NVMe-oF, SAN LUN), the template role writes the QCOW2 image
+to the remote block device — the same mechanism as writing to
+a local disk, but targeting the remote storage target.
+
+Template roles declare which image formats they support in
+their output contract
+([inventory-provisioning-separation EP](../inventory-provisioning-separation/README.md)):
+
+```yaml
+# meta/osac_contract.yaml
+inputs:
+  required:
+    - compute_instance_image
+  image_formats:
+    supported: [qcow2, iso, raw]
+    preferred: qcow2
+```
+
+At ComputeInstance creation time, the fulfillment-service
+resolves the `imageRef` by:
+
+1. Looking up the Image resource by name.
+2. Reading the selected template role's supported image formats
+   from its contract.
+3. Selecting the best matching source from the Image's `sources`
+   list (preferring the template role's `preferred` format, then
+   falling back to any `supported` format).
+4. Storing the selected source in `resolvedImage` on the
+   ComputeInstance record.
+
+If no source format matches the template role's supported
+formats, the creation request fails with a validation error:
+"Image 'rhel-9.6-gpu' has no source compatible with template
+'metal3_bm_rhel' (supported formats: qcow2, iso, raw)."
+
+This means:
+- **Tenants never specify image format.** They reference an
+  Image by name. The system picks the right format.
+- **Providers control format availability.** They upload images
+  in the formats their backends support. A provider using only
+  KubeVirt needs only QCOW2 sources. A provider supporting
+  both VM and BM uploads QCOW2 (which works for both).
+- **Adding a new backend** does not require new images — if the
+  existing QCOW2 sources are present, a new BM template role
+  that supports QCOW2 (via Ironic IPA) works immediately with
+  all existing images.
+- **Format-specific backends** (e.g., a legacy PXE-only backend
+  that requires ISO) can coexist — the provider adds an ISO
+  source to the Image, and the template role's contract
+  declares ISO support.
+
+##### Power and console access
+
+`powerState` and `consoleAccess` provide power control and console
+access for both VM and bare-metal ComputeInstances. These fields
+exist on all ComputeInstances regardless of hardware type — the
+tenant API is the same, the mechanism is backend-specific:
+
+| Field | VM (KubeVirt) | Bare metal (Metal3) |
+|---|---|---|
+| `spec.powerState` | VirtualMachine `runStrategy` | BareMetalHost `spec.online` + Redfish power API |
+| `spec.consoleAccess.serialConsole` | Enable/disable serial console | Enable/disable serial console |
+| `status.powerState` | Actual power state from KubeVirt | Actual power state from BMH status |
+| `status.consoleAccess.serialConsoleURL` | WebSocket URL via KubeVirt console proxy | WebSocket URL via Redfish console proxy |
+
+Power state values: `On`, `Off`, `Restart`. The spec field is the
+desired state; the status field reflects the actual state. The
+template role's `status.yaml` entry point reports the current
+power state.
+
+The `serialConsoleURL` is a WebSocket endpoint served by OSAC's
+console proxy. The proxy terminates the tenant's WebSocket
+connection and bridges to the backend-specific console mechanism.
+The tenant does not need to know which backend is in use.
+
+Serial console access was previously implemented for VMs
+(MGMT-22670). This proposal extends it to bare-metal classes
+through the unified ComputeInstance API. A future EP may add
+graphical console support (MGMT-23836).
 
 For bare-metal classes, VM-specific fields (`cores`, `memoryGiB`,
 `bootDisk`, `runStrategy`) are either ignored or validated as fixed
@@ -419,6 +557,48 @@ the backend:
 - `pack` — fill racks/domains before spilling to the next
 - `spread` — distribute across failure domains
 - Backends that don't support placement ignore this field
+
+##### GPU fabric isolation (transparent)
+
+When a ComputeInstanceGroup uses a ComputeInstanceClass with GPUs
+and the provider's infrastructure includes NVLink and/or
+InfiniBand fabric, the provisioning workflow **automatically**
+configures GPU fabric isolation for the group. The tenant does not
+need to request this — it is a provider-side capability, not a
+tenant-facing resource.
+
+The AAP workflow handles GPU fabric in a post-provision phase:
+
+1. **NVLink partitions**: If the provider has NMX-M configured and
+   the ComputeInstanceClass describes NVLink-capable GPUs, the
+   workflow runs a post-create hook from
+   `osac.compute_gpu_fabric` after provisioning. This
+   collection uses `nvidia.nmx` to create or extend an NVLink
+   partition for the group's instances, scoped to the tenant.
+
+2. **InfiniBand PKEYs**: If the provider has UFM configured, the
+   workflow adds the provisioned instances' IB GUIDs to a
+   tenant-scoped PKEY using `nvidia.ufm`. This isolates
+   InfiniBand traffic between tenants.
+
+3. **Teardown**: On ComputeInstance deletion or group scale-down,
+   the `instance.delete.main` role in `osac.compute_gpu_fabric`
+   removes the instance from the NVLink partition and IB PKEY.
+   When the last instance in a group is removed, the partition
+   and PKEY are deleted.
+
+The `placementPolicy.affinityKey: "nvlink-domain"` on a
+ComputeInstanceGroup informs `osac.service.select_hosts` (per the
+inventory-provisioning-separation EP) to select hosts within the
+same NVLink domain, ensuring the group gets a contiguous NVLink
+partition.
+
+GPU fabric configuration is determined by the provider's AAP
+environment — if the `nvidia.nmx` and `nvidia.ufm` collections
+are present in the execution environment and the inventory
+host_vars include `nvlink_domain`, the workflow activates
+automatically. Providers without GPU fabric infrastructure simply
+skip this phase.
 
 ### Workflow Description
 
@@ -485,7 +665,7 @@ the backend:
 
 | Resource | Change |
 |---|---|
-| ComputeInstance | Add `computeInstanceClass`, `region`, `imageRef`, `sshKeyRefs`, `resolvedImage`, `resolvedSshKeys` fields. Deprecate `template`, `template_parameters`, `image` (inline), `sshKey` (inline). |
+| ComputeInstance | Add `computeInstanceClass`, `region`, `imageRef`, `sshKeyRefs`, `resolvedImage`, `resolvedSshKeys`, `powerState`, `consoleAccess` fields. Deprecate `template`, `template_parameters`, `image` (inline), `sshKey` (inline). |
 
 #### Deprecated resources
 
@@ -528,15 +708,19 @@ New CRD:
 
 Modified CRD:
 
-- `ComputeInstance` — add `computeInstanceClass` and `region`
-  fields to spec
+- `ComputeInstance` — add `computeInstanceClass`, `region`,
+  `powerState`, and `consoleAccess` fields to spec and status
 
 #### AAP changes
 
-- Template role dispatch based on `ComputeInstanceTemplate.backend`
-  instead of a hardcoded template name
-- Existing template roles (`ocp_virt_vm`) adapted to receive
-  standardized variables instead of freeform `template_parameters`
+- Role dispatch based on ComputeInstanceClass `collection` field
+  following the [OSAC Add-On convention](../osac-addon/README.md)
+  — operator reads the class, looks up ResourceAction roles in
+  the provider collection (e.g., `osac.compute_kubevirt`)
+- Existing template roles (`ocp_virt_vm`) migrated to
+  ResourceAction naming (`instance.create.main`) and adapted to
+  receive standardized variables instead of freeform
+  `template_parameters`
 - Template selection is performed by the fulfillment-service (not
   AAP) based on region and class template list
 
@@ -717,6 +901,10 @@ TBD — will cover:
 - ComputeInstanceGroup scaling (up and down)
 - Template selection (multi-site, capacity-based)
 - Migration from old template model to new class model
+- Power state transitions (On/Off/Restart) for VM and bare-metal
+- Serial console access for VM and bare-metal classes
+- GPU fabric isolation: NVLink partition and IB PKEY lifecycle
+  with ComputeInstanceGroup create/scale/delete
 
 ## Graduation Criteria
 

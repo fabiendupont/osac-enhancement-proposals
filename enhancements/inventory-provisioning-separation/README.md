@@ -3,14 +3,18 @@ title: inventory-provisioning-separation
 authors:
   - Fabien Dupont
 creation-date: 2026-04-17
-last-updated: 2026-04-17
+last-updated: 2026-04-29
 tracking-link:
   - TBD
 see-also:
   - enhancements/unified-compute-model/README.md
+  - enhancements/osac-addon/README.md
   - enhancements/carbide-integration/README.md
   - enhancements/metal3-compute-backend/README.md
   - enhancements/image-and-sshkey-resources/README.md
+  - enhancements/catalog-items/README.md
+  - enhancements/cost-metric-mapping/README.md
+  - enhancements/composable-catalog-items/README.md
   - https://github.com/osac-project/enhancement-proposals/pull/20 (Region/AZ)
 replaces:
 superseded-by:
@@ -35,6 +39,12 @@ A shared host selection utility in `osac.service` bridges the two:
 given a ComputeInstanceClass and placement policy, it queries AAP
 inventory for matching available hosts and returns the selected set
 to the provisioning role.
+
+This EP also formalizes three role contracts — input, output, and
+inventory host_vars — and introduces a compliance checking
+mechanism that validates template roles against the OSAC API
+schema at build time, preventing contract drift between Ansible
+roles and the fulfillment-service API.
 
 ## Motivation
 
@@ -118,6 +128,11 @@ for provisioning.
 - Provide a shared host selection utility in `osac.service`.
 - Ensure ComputeInstanceTemplate roles receive pre-selected hosts,
   not raw inventory queries.
+- Formalize input, output, and inventory host_vars contracts for
+  template roles.
+- Provide build-time and CI compliance checking that validates
+  template role contracts against the OSAC API schema derived
+  from proto definitions.
 
 ### Non-Goals
 
@@ -125,8 +140,12 @@ for provisioning.
 - Implementing placement algorithms beyond basic first-fit (advanced
   placement strategies like NVLink-aware packing are backend- and
   topology-specific and will evolve incrementally).
-- Changes to the fulfillment-service or osac-operator — this EP
-  is entirely within the AAP layer.
+- Composed catalog item orchestration — the output contract
+  enables it, but the workflow generator and catalog composition
+  model are covered by a separate EP.
+- Runtime contract enforcement as a hard gate — runtime
+  validation is opt-in for debugging. Build-time and CI checks
+  are the primary enforcement mechanism.
 
 ## Proposal
 
@@ -150,16 +169,23 @@ Phase 2: Provision (template-specific)
   │ Output: provisioned compute instances
   │
   ▼
-Phase 3: Update inventory (shared)
+Phase 3: Report outputs (template-specific)
+  │
+  │ Input:  provisioning results from Phase 2
+  │ Action: export standardized outputs via set_stats
+  │ Output: instance_id, ip_address, endpoint_url, etc.
+  │
+  ▼
+Phase 4: Update inventory (shared)
   │
   │ Input:  provisioned host names, tenant, state
   │ Action: update AAP inventory host_vars (e.g., consumption, tenant, state)
 ```
 
-Phase 1 and Phase 3 are **shared** across all backends — they
-operate on AAP inventory, not on any specific backend API. Phase 2
-is **template-specific** — each backend has its own provisioning
-role.
+Phase 1 and Phase 4 are **shared** across all backends — they
+operate on AAP inventory, not on any specific backend API. Phases
+2 and 3 are **template-specific** — each backend has its own
+provisioning role and declares the outputs it produces.
 
 ### Host selection utility
 
@@ -282,6 +308,304 @@ The role's responsibility is solely to **provision** — create the
 backend resources (BareMetalHost, VirtualMachine, NICo Instance)
 and report status. It does not search for available hosts.
 
+### ComputeInstanceTemplate output contract
+
+Template roles must declare and produce a standardized set of
+outputs via `ansible.builtin.set_stats`. These outputs serve
+three consumers:
+
+- **The feedback controller** in osac-operator, which syncs
+  provisioning results back to the fulfillment-service PostgreSQL
+  database and updates the ComputeInstance CRD status.
+- **Downstream workflow nodes** in composed catalog items, where
+  one role's outputs feed into another role's inputs (e.g., a
+  compute role produces `instance_id`, which a monitoring role
+  consumes).
+- **The fulfillment-service API**, which exposes provisioning
+  results to tenants (IP address, endpoint URL, connection
+  details).
+
+#### Output declaration
+
+Each template role declares its outputs in
+`meta/osac_contract.yaml`:
+
+```yaml
+# meta/osac_contract.yaml
+contract_version: "1"
+
+inputs:
+  required:
+    - compute_instance_hosts
+    - compute_instance_image
+    - compute_instance_ssh_keys
+    - compute_instance_subnet
+    - compute_instance_class
+  optional:
+    - compute_instance_security_groups
+    - compute_instance_user_data
+
+outputs:
+  required:
+    instance_id:
+      type: string
+      description: Backend-specific instance identifier
+    instance_state:
+      type: string
+      description: Provisioning result state
+      enum: [running, error]
+    ip_address:
+      type: string
+      description: Primary IP address assigned to the instance
+  optional:
+    hostname:
+      type: string
+      description: FQDN assigned to the instance
+    endpoint_url:
+      type: string
+      description: Service endpoint URL (for serving workloads)
+    additional_ips:
+      type: list
+      description: Secondary IP addresses
+    storage_device:
+      type: string
+      description: Block storage device path
+    backend_ref:
+      type: string
+      description: Backend-specific resource reference (e.g., BareMetalHost name, VirtualMachine UID)
+```
+
+#### Output production
+
+Provider roles produce outputs at the end of `instance.create.main`
+using `set_stats`, following the
+[OSAC Add-On I/O contract](../osac-addon/README.md). The
+`set_stats` module writes data to the AAP job artifacts, making
+them available to the workflow engine and to any downstream
+consumer.
+
+```yaml
+# At the end of instance.create.main:
+- name: Report provisioning outputs
+  ansible.builtin.set_stats:
+    data:
+      instance_id: "{{ created_instance.metadata.uid }}"
+      instance_state: "running"
+      ip_address: "{{ created_instance.status.ip }}"
+      hostname: "{{ created_instance.status.hostname | default(omit) }}"
+      backend_ref: "{{ created_instance.metadata.name }}"
+```
+
+All required outputs must be present when `instance_state` is
+`running`. When `instance_state` is `error`, only `instance_id`
+and `instance_state` are required — the role should also set an
+`error_message` output with a human-readable failure description.
+
+#### Output consumption by the feedback controller
+
+The osac-operator feedback controller reads `set_stats` outputs
+from the AAP job artifacts API and maps them to ComputeInstance
+CRD status fields:
+
+| Output | CRD status field |
+|---|---|
+| `instance_id` | `status.instanceId` |
+| `instance_state` | `status.state` |
+| `ip_address` | `status.ipAddress` |
+| `hostname` | `status.hostname` |
+| `endpoint_url` | `status.endpointUrl` |
+| `backend_ref` | `status.backendRef` |
+
+This replaces the current ad hoc status scraping where the
+feedback controller parses backend-specific CRD fields
+differently per template type. With the output contract, the
+feedback controller has a single, backend-agnostic code path.
+
+#### Delete outputs
+
+Provider roles must also produce outputs at the end of
+`instance.delete.main`:
+
+```yaml
+- name: Report deletion outputs
+  ansible.builtin.set_stats:
+    data:
+      instance_id: "{{ instance_id }}"
+      instance_state: "deleted"
+```
+
+#### Signal outputs
+
+The optional `instance.signal.main` role, when implemented,
+produces the same output schema as `instance.create.main`. This
+enables periodic status reconciliation — the osac-operator
+can invoke `instance.signal.main` to refresh the CRD status
+without re-provisioning.
+
+### Contract compliance checking
+
+Template roles must comply with the contracts defined above —
+the input contract (what variables the role expects), the output
+contract (what `set_stats` keys the role produces), and the
+inventory host_vars contract (what host_vars `select_hosts`
+requires). Drift between these contracts and the OSAC API schema
+causes silent failures: a role that stops producing `ip_address`
+breaks the feedback controller; a role that expects a variable
+the operator no longer sends fails at runtime.
+
+The compliance checking mechanism catches these mismatches at
+build time (EE image build and CI), not at provisioning time.
+
+#### Contract schema source of truth
+
+The fulfillment-service proto definitions are the authoritative
+source for the OSAC API schema. The contract schemas are derived
+from these protos:
+
+- **Input contract** fields map to ComputeInstance proto spec
+  fields (e.g., `compute_instance_image` maps to
+  `ComputeInstance.spec.resolvedImage`)
+- **Output contract** fields map to ComputeInstance proto status
+  fields (e.g., `ip_address` maps to
+  `ComputeInstance.status.ipAddress`)
+- **Inventory host_vars** map to ComputeInstanceClass proto
+  capability fields
+
+A JSON Schema file is generated from the proto definitions
+and published as part of the `osac.service` collection:
+
+```
+osac.service/
+  schemas/
+    contract_v1.json          # JSON Schema for osac_contract.yaml
+    inputs_v1.json            # Input variable schema (from proto)
+    outputs_v1.json           # Output variable schema (from proto)
+    host_vars_v1.json         # Inventory host_vars schema
+```
+
+#### Build-time validation (EE image build)
+
+A validation role `osac.service.validate_contracts` runs during
+EE image build as a post-build check. It:
+
+1. Discovers all roles in the EE that contain
+   `meta/osac_contract.yaml`.
+2. Validates each `osac_contract.yaml` against
+   `contract_v1.json` (structural correctness).
+3. Validates declared inputs against `inputs_v1.json` — are all
+   required inputs from the OSAC API listed? Are there unknown
+   inputs that suggest the role expects variables the operator
+   will not provide?
+4. Validates declared outputs against `outputs_v1.json` — does
+   the role declare all required outputs? Are output types
+   correct?
+5. Reports warnings for optional fields not declared and errors
+   for required fields missing or type mismatches.
+
+```bash
+# In the EE build pipeline:
+ansible-playbook osac.service.validate_contracts \
+  -e schema_dir=osac.service/schemas \
+  -e role_dirs=osac.compute_kubevirt,osac.compute_metal3
+```
+
+A non-zero exit code fails the EE build if any required contract
+field is missing or mistyped.
+
+#### CI validation (per-role PR checks)
+
+Each provider collection runs contract validation in CI on
+every PR that modifies role code or `meta/osac.yaml`. This
+aligns with the `osac addon lint` tool from the
+[OSAC Add-On EP](../osac-addon/README.md):
+
+```yaml
+# .github/workflows/contract-check.yml
+- name: Validate OSAC contract
+  run: |
+    osac addon lint osac.compute_metal3
+```
+
+The linter performs:
+
+1. **Schema validation:** `meta/osac.yaml` declares all
+   required fields and types match the OSAC API schema.
+2. **Static analysis:** `instance.create.main` and
+   `instance.delete.main` task files contain `set_stats` calls
+   that produce all declared required outputs. This is a
+   best-effort static check — it parses task YAML for
+   `ansible.builtin.set_stats` calls and verifies the `data`
+   keys match the declared outputs.
+3. **Rollback completeness:** every `create.main` has a
+   corresponding `delete.main`.
+
+#### Runtime validation (optional, defense in depth)
+
+The `osac.service.execute_catalog_item` role (used for
+composed catalog items) can optionally validate outputs at
+runtime after each workflow node completes:
+
+```yaml
+- name: Validate outputs from {{ node.name }}
+  ansible.builtin.assert:
+    that:
+      - item in (ansible_stats.data | default({}))
+    fail_msg: >
+      Role {{ node.role }} did not produce required output '{{ item }}'.
+      Check the role's set_stats call in instance.create.main.
+  loop: "{{ node.contract.outputs.required | list }}"
+```
+
+Runtime validation is disabled by default (the linter and CI
+checks are the primary enforcement). It can be enabled per
+deployment via `osac_validate_outputs_at_runtime: true` for
+debugging or during initial provider onboarding.
+
+#### Contract versioning
+
+The `contract_version` field in `osac_contract.yaml` tracks
+breaking changes to the contract schema. When the OSAC API adds
+a new required output field (e.g., a future `gpu_device_id`),
+the contract version increments. Roles declaring an older
+contract version receive a CI warning with a migration guide.
+Roles must update to the current contract version before the
+next EE release.
+
+The version follows a simple integer scheme (1, 2, 3...), not
+semver. Each version bump includes a changelog in
+`osac.service/schemas/CHANGELOG.md` listing added, changed, and
+removed fields.
+
+#### Proto-to-schema generation
+
+The JSON Schema files are generated from the fulfillment-service
+proto definitions using a `buf` plugin or a standalone Go tool
+that reads the proto descriptors and emits JSON Schema:
+
+```bash
+# In fulfillment-service CI, after buf generate:
+go run ./cmd/gen-contract-schema \
+  --proto proto/private/osac/private/v1/compute_instance_type.proto \
+  --output schemas/
+```
+
+The generated schemas are published as part of the
+`osac.service` collection. When a proto field changes (renamed,
+removed, type changed), the schema regeneration produces a
+different output, and any template role CI that depends on the
+schema fails — surfacing the contract drift immediately.
+
+This creates a closed feedback loop:
+
+```
+Proto change (fulfillment-service)
+  → schema regeneration (fulfillment-service CI)
+  → osac.service collection update
+  → template role CI fails (contract mismatch)
+  → role author updates osac_contract.yaml and set_stats calls
+  → EE build validates all roles pass
+```
+
 ### Example: workflow composition
 
 ```yaml
@@ -296,18 +620,25 @@ tasks:
       select_hosts_count: 1
       select_hosts_region: "{{ compute_instance.spec.region | default(omit) }}"
 
-  # Phase 2: Provision (template-specific)
+  # Phase 2: Provision (provider-specific ResourceAction)
+  # The operator reads the ComputeInstanceClass collection field
+  # and invokes the instance.create.main role from that collection.
   # Note: compute_instance_image and compute_instance_ssh_keys contain
   # resolved data from the ComputeInstance's resolvedImage and resolvedSshKeys
   # fields, populated by the fulfillment-service at creation time.
   - name: Provision compute instance
     ansible.builtin.include_role:
-      name: "{{ compute_instance_template_collection }}.{{ compute_instance_template_role }}"
-      tasks_from: install.yaml
+      name: "{{ compute_instance_class_collection }}.instance.create.main"
     vars:
       compute_instance_hosts: "{{ select_hosts_result }}"
 
-  # Phase 3: Update inventory (shared, inventory-agnostic)
+  # Phase 3: Report outputs (via set_stats, per OSAC Add-On convention)
+  # The provider role's instance.create.main produces outputs via set_stats:
+  #   instance_id, instance_state, ip_address, hostname, backend_ref
+  # These are available in ansible_stats.data for downstream consumers
+  # and in AAP job artifacts for the feedback controller.
+
+  # Phase 4: Update inventory (shared, inventory-agnostic)
   - name: Update host state
     ansible.builtin.include_role:
       name: osac.service.update_host_state
@@ -340,10 +671,36 @@ receives pre-selected hosts and attaches them to VPCs.
 New roles in `osac.service`:
 - `select_hosts` — host selection with placement and locking
 - `update_host_state` — inventory state update (backend-aware)
+- `validate_contracts` — build-time contract compliance checker
+- `execute_catalog_item` — generic workflow generator for
+  composed catalog items (see composable-catalog-items EP)
+
+New CLI tool:
+- `osac-contract-validate` — CI-oriented contract validator
+  with static analysis of `set_stats` calls
+
+New schemas in `osac.service`:
+- `schemas/contract_v1.json` — JSON Schema for
+  `osac_contract.yaml`
+- `schemas/inputs_v1.json` — input variable schema (generated
+  from proto)
+- `schemas/outputs_v1.json` — output variable schema (generated
+  from proto)
+- `schemas/host_vars_v1.json` — inventory host_vars schema
+
+New proto tooling in `fulfillment-service`:
+- `cmd/gen-contract-schema` — generates JSON Schema from proto
+  descriptors for ComputeInstance spec and status fields
 
 Modified roles:
-- Existing template roles refactored to not query inventory
-  directly
+- Existing template roles refactored to ResourceAction naming
+  (`instance.create.main`, `instance.delete.main`,
+  `instance.signal.main`) in per-provider collections
+  (`osac.compute_kubevirt`, `osac.compute_metal3`):
+  - Not query inventory directly
+  - Add `meta/osac.yaml` declaring inputs and outputs (per
+    [OSAC Add-On convention](../osac-addon/README.md))
+  - Produce standardized outputs via `set_stats`
 
 AAP configuration:
 - Dynamic inventory sources configured per deployment (NetBox,
@@ -369,7 +726,34 @@ Different inventory plugins may not provide all required host_vars.
 *Mitigation:* Document the contract. Provide example constructed
 inventory configs that map source-specific fields to the standard
 host_vars. Validate required host_vars in `select_hosts` and fail
-with a clear error if missing.
+with a clear error if missing. The `host_vars_v1.json` schema
+enables automated validation of inventory plugin output in CI.
+
+#### Contract drift between Ansible roles and OSAC API
+
+Proto fields change (renamed, removed, type changed) in the
+fulfillment-service. Template roles that produce outputs
+matching the old field names silently break the feedback
+controller.
+
+*Mitigation:* The compliance checking mechanism creates a closed
+feedback loop: proto changes regenerate JSON schemas, which fail
+template role CI, which forces role authors to update before the
+next EE build. Build-time validation in the EE pipeline is the
+final gate — no EE image ships with contract-noncompliant roles.
+
+#### Static analysis limitations
+
+The `osac-contract-validate` CLI cannot follow dynamic
+`include_role`, conditional `when` branches, or Jinja2-templated
+`set_stats` keys. A role could pass static analysis but fail to
+produce required outputs at runtime due to a conditional branch.
+
+*Mitigation:* Static analysis is best-effort and catches the
+common cases (missing `set_stats`, renamed keys, wrong module
+name). Runtime validation is available as defense in depth for
+initial template onboarding and debugging. Integration tests
+in the template role's own CI should cover conditional branches.
 
 #### State synchronization
 
@@ -386,6 +770,15 @@ provisioning and fails fast if not.
 - Adds an inventory abstraction layer that may feel over-engineered
   for simple single-backend deployments.
 - Requires inventory plugins to conform to the host_vars contract.
+- The contract compliance mechanism adds build-time and CI
+  dependencies between the fulfillment-service proto definitions
+  and template role repositories. A proto change in
+  fulfillment-service can break template role CI in a separate
+  repo, requiring coordinated updates.
+- Template role authors must maintain `meta/osac_contract.yaml`
+  alongside the role code — an additional file to keep in sync.
+  However, this is less work than debugging silent contract
+  drift at runtime.
 
 ## Alternatives (Not Implemented)
 
@@ -419,6 +812,30 @@ the right tool for querying and filtering it.
    that returns matching hosts without acquiring them? This would
    enable capacity planning UIs without the risk of accidental
    allocation.
+
+3. **Contract schema distribution.** Should the JSON schemas
+   generated from protos be distributed as part of the
+   `osac.service` Ansible collection (bundled in the EE), as a
+   separate Python package (`osac-contract-schemas`), or as a
+   git submodule? The collection approach keeps everything in
+   one artifact but creates a release dependency between
+   fulfillment-service proto changes and collection releases.
+
+4. **Third-party template roles.** How should external
+   contributors (e.g., NICo backend authors at NVIDIA) validate
+   their template roles against the OSAC contract? They need
+   access to the schema files but may not have access to the
+   fulfillment-service proto repository. Publishing schemas to
+   a public registry (e.g., Ansible Galaxy metadata or a
+   dedicated schema repository) would enable external
+   validation.
+
+5. **Output extensibility.** Should template roles be allowed
+   to produce additional outputs beyond the contract (e.g.,
+   backend-specific metadata like `ironic_node_uuid` or
+   `kubevirt_vm_namespace`)? If so, should these be declared
+   in `osac_contract.yaml` under an `extra` section, or left
+   undeclared and passed through opaquely?
 
 ## Test Plan
 
@@ -464,6 +881,25 @@ no cross-component version skew within a single EE deployment.
   host may remain marked as `available` in inventory despite being
   provisioned. Manually update the host state in the inventory
   source (NetBox, NICo, or Ironic).
+- **Missing outputs in feedback controller:** If the
+  ComputeInstance CRD status is not updating after provisioning,
+  check the AAP job artifacts for `set_stats` output. If outputs
+  are missing, the provider role's `instance.create.main` may
+  not be producing them. Run `osac addon lint` against the
+  collection to check compliance. Enable runtime validation
+  (`osac_validate_outputs_at_runtime: true`) to get immediate
+  failure feedback.
+- **Contract validation failure in CI:** The provider role's
+  `meta/osac.yaml` does not match the current OSAC API
+  schema. Check which schema version the role declares and
+  compare with the current schema in
+  `osac.service/schemas/`. Review the OSAC Add-On EP
+  for field changes since the role's last update.
+- **EE build failure on contract check:** Run
+  `osac.service.validate_contracts` locally with verbose output
+  to identify which roles fail and which fields are missing or
+  mistyped. Cross-reference with the proto definitions in
+  `fulfillment-service/proto/`.
 
 ## Infrastructure Needed [optional]
 

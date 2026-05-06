@@ -8,6 +8,7 @@ tracking-link:
   - https://issues.redhat.com/browse/MGMT-22637
 see-also:
   - Region and Availability Zone API: https://github.com/osac-project/enhancement-proposals/pull/20
+  - enhancements/osac-addon/README.md
 replaces:
   - N/A
 superseded-by:
