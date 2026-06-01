@@ -3,7 +3,7 @@ title: OSAC Add-On Model
 authors:
   - fdupont@redhat.com
 creation-date: 2026-04-30
-last-updated: 2026-05-06
+last-updated: 2026-06-01
 tracking-link:
   - "OSAC-30: OSAC Use-Case Composability in Enclave Plugin"
   - "OSAC-291: Design plugin dependency model"
@@ -100,11 +100,11 @@ However:
 
 - The operator hardcodes AAP role dispatch — add-ons cannot
   register provisioning logic without Go code changes.
-- Templates (ClusterTemplate, ComputeInstanceTemplate) and
-  lifecycle dispatch are separate concepts that could be
-  unified.
-- CatalogItems (not yet implemented) are designed to sit on
-  Templates — aligning now avoids a future refactor.
+- CatalogItems now exist upstream
+  (`ComputeInstanceCatalogItem`, `ClusterCatalogItem`) with
+  published/unpublished visibility and field-level access
+  control, but they lack provisioning metadata — they don't
+  know which Ansible collection or role to invoke.
 - There is no rollback mechanism when provisioning fails.
 - There is no validation that Ansible roles follow OSAC
   conventions.
@@ -117,10 +117,11 @@ However:
 2. **Hardcoded provisioning dispatch.** Every new resource type
    requires Go code changes in the operator.
 
-3. **Template / dispatch fragmentation.** A Template is an
-   Ansible role + parameters that creates a resource. A
-   lifecycle dispatch is an Ansible role that runs on a CR
-   event. Same thing, implemented separately.
+3. **CatalogItems lack provisioning metadata.** CatalogItems
+   define what tenants see (title, field constraints,
+   visibility) but not how resources are provisioned. The
+   binding between a CatalogItem and its Ansible collection
+   is missing.
 
 4. **No rollback.** Failed provisioning leaves partial
    resources. AAP Workflows support compensating actions but
@@ -374,10 +375,60 @@ rules:
 ### Part 2: Collection-Per-Provider Model
 
 Each provider ships its own Ansible collection. There is no
-dispatcher role — the *Class resource's `collection` field tells
-the operator which collection to use, and the role naming
+dispatcher role — the **CatalogItem's provisioning metadata**
+tells the operator which collection to use, and the role naming
 convention tells it which role to invoke. Each collection is
 self-contained and independently versioned.
+
+#### CatalogItem Provisioning Metadata
+
+Upstream CatalogItems (`ComputeInstanceCatalogItem`,
+`ClusterCatalogItem`) define what tenants see: title,
+description, field definitions, published/unpublished
+visibility. This EP extends CatalogItems with **provisioning
+metadata** that binds them to Ansible collections:
+
+```protobuf
+message ProvisioningMetadata {
+  string collection = 1;       // e.g., "osac.compute_kubevirt"
+  string resource_action = 2;  // e.g., "instance" (role prefix)
+}
+```
+
+```yaml
+# Example: ComputeInstanceCatalogItem with provisioning metadata
+id: "rhel10-gpu-vm"
+title: "RHEL 10 GPU VM"
+description: "GPU-enabled virtual machine with RHEL 10"
+published: true
+template: "gpu-vm-template-id"
+provisioning:
+  collection: osac.compute_kubevirt
+  resource_action: instance
+field_definitions:
+  - field: cores
+    locked: false
+    default: 4
+  - field: memory_gib
+    locked: true
+    value: 64
+```
+
+The dispatch chain becomes:
+
+```
+ComputeInstance CR
+  → spec.catalogItemID → CatalogItem
+    → provisioning.collection → "osac.compute_kubevirt"
+    → provisioning.resource_action → "instance"
+      → role: instance.create.main (derived from event)
+```
+
+This separates concerns cleanly:
+- **CatalogItem** = what the tenant sees + how it's provisioned
+- **Template** = the resource spec defaults (cores, memory, etc.)
+- **Collection** = the provisioning implementation
+- **ResourceAction** = the role naming convention within the collection
 
 ```mermaid
 graph LR
@@ -469,21 +520,23 @@ load balancing) can ship a **single collection** covering all
 of them:
 
 ```
-netris.osac/                    # one collection, multiple domains
+netris.osac/                              # one collection, multiple domains
 ├── meta/addon.yaml
 ├── roles/
-│   ├── virtual_network/        # networking
-│   │   ├── meta/osac.yaml       # resource_type: VirtualNetwork
-│   │   └── tasks/
-│   ├── subnet/                 # networking
-│   │   ├── meta/osac.yaml       # resource_type: Subnet
-│   │   └── tasks/
-│   ├── load_balancer/          # lb
-│   │   ├── meta/osac.yaml       # resource_type: LoadBalancer
-│   │   └── tasks/
-│   └── dns_record/             # dns
-│       ├── meta/osac.yaml       # resource_type: DnsRecord
-│       └── tasks/
+│   ├── virtual_network.create.main/      # networking
+│   │   ├── meta/osac.yaml                 # resource_type: VirtualNetwork
+│   │   └── tasks/main.yml
+│   ├── virtual_network.delete.main/
+│   │   ├── meta/osac.yaml
+│   │   └── tasks/main.yml
+│   ├── subnet.create.main/              # networking
+│   │   ├── meta/osac.yaml                 # resource_type: Subnet
+│   │   └── tasks/main.yml
+│   ├── load_balancer.create.main/        # lb
+│   │   ├── meta/osac.yaml                 # resource_type: LoadBalancer
+│   │   └── tasks/main.yml
+│   └── auth/                             # internal helper
+│       └── meta/osac.yaml                 # internal: true
 ```
 
 The `meta/addon.yaml` declares all resource types the collection
@@ -500,37 +553,28 @@ resource_types:
     scope: tenant
   - name: LoadBalancer
     scope: tenant
-  - name: DnsRecord
-    scope: tenant
 ```
 
-Multiple *Class CRs reference the same collection:
+Multiple CatalogItems reference the same collection with
+different `resource_action` values:
 
 ```yaml
-kind: NetworkClass
-metadata:
-  name: netris
-spec:
+# ComputeInstanceCatalogItem referencing netris networking
+provisioning:
   collection: netris.osac
+  resource_action: virtual_network
 ---
-kind: LoadBalancerClass
-metadata:
-  name: netris
-spec:
+# Another CatalogItem, same collection, different resource
+provisioning:
   collection: netris.osac
----
-kind: DnsClass
-metadata:
-  name: netris
-spec:
-  collection: netris.osac
+  resource_action: load_balancer
 ```
 
-The operator dispatch works identically — it looks up the role
-matching the resource type in the collection, regardless of how
-many domains the collection covers. Each role's `meta/osac.yaml`
-declares its `resource_type`, so the operator knows which role
-to invoke.
+The operator dispatch works identically — it derives the role
+name from the CatalogItem's `resource_action` + the event,
+regardless of how many domains the collection covers. Each
+role's `meta/osac.yaml` declares its `resource_type`, so the
+operator knows which role to invoke.
 
 This flexibility means:
 - One collection per partner is fine (less repos to maintain)
@@ -539,30 +583,41 @@ This flexibility means:
 - OSAC-maintained collections stay granular (different teams)
 - The convention doesn't force a particular granularity
 
-#### *Class references a collection
+#### CatalogItem binds collection to offering
 
 ```yaml
-kind: ObjectStoreClass
-metadata:
-  name: odf
-spec:
-  collection: osac.object_storage_odf
-  capabilities: [S3_COMPATIBLE, VERSIONING]
+# ComputeInstanceCatalogItem
+id: "rhel10-vm"
+title: "RHEL 10 Virtual Machine"
+published: true
+template: "rhel10-template-id"
+provisioning:
+  collection: osac.compute_kubevirt
+  resource_action: instance
 ---
-kind: NetworkClass
-metadata:
-  name: netris
-spec:
-  collection: netris.osac
-  capabilities: [L2_ISOLATION, DUAL_STACK]
+# ClusterCatalogItem
+id: "managed-ocp"
+title: "Managed OpenShift Cluster"
+published: true
+template: "ocp-hcp-template-id"
+provisioning:
+  collection: osac.kubernetes_hcp
+  resource_action: cluster
 ---
-kind: VPNClass
-metadata:
-  name: ovnk
-spec:
-  collection: osac.vpn_ovnk
-  capabilities: [SITE_TO_SITE, INTER_REGION]
+# ComputeInstanceCatalogItem (partner)
+id: "bare-metal-gpu"
+title: "Bare Metal GPU Node"
+published: true
+template: "bm-gpu-template-id"
+provisioning:
+  collection: massopencloud.osac
+  resource_action: host
 ```
+
+*Class CRs (`NetworkClass`, `ComputeInstanceClass`) define
+platform-level capabilities and constraints but no longer carry
+provisioning dispatch metadata. The `collection` field moves
+to CatalogItems, which are the user-facing abstraction.
 
 #### Operator dispatch flow
 
@@ -570,15 +625,15 @@ spec:
 sequenceDiagram
     participant CR as Resource CR
     participant OP as osac-operator
-    participant CL as *Class CR
+    participant CI as CatalogItem
     participant HUB as Automation Hub<br/>(cached)
     participant AAP as AAP Controller
 
     CR->>OP: CR change detected
-    OP->>CL: Read *Class (e.g., ObjectStoreClass "odf")
-    CL-->>OP: collection: osac.object_storage_odf
-    OP->>HUB: Look up roles for (resourceType, event)
-    HUB-->>OP: main: bucket.create<br/>hooks: acme.osac_compliance.bucket.post_create
+    OP->>CI: Read CatalogItem (from CR spec)
+    CI-->>OP: provisioning.collection: osac.compute_kubevirt<br/>provisioning.resource_action: instance
+    OP->>HUB: Look up roles for (collection, resource_action, event)
+    HUB-->>OP: main: instance.create.main<br/>hooks: acme.osac_compliance.instance.post_create
     OP->>AAP: Generate & submit Workflow<br/>(pre → main → post + rollback)
     AAP-->>OP: Workflow complete (set_stats outputs)
     OP->>CR: Update status (state, outputs)
@@ -588,16 +643,16 @@ sequenceDiagram
 Resource CR change detected
         │
         ▼
-Read *Class referenced by resource
-(e.g., ObjectStoreClass "odf")
+Read CatalogItem referenced by resource
+(e.g., ComputeInstance.spec.catalogItemID)
         │
         ▼
-Get collection from *Class
-(e.g., osac.object_storage_odf)
+Get collection + resource_action from CatalogItem.provisioning
+(e.g., osac.compute_kubevirt, instance)
         │
         ▼
-Look up cached main-phase role in that collection
-(e.g., bucket.create.main)
+Derive role name from event
+(e.g., instance.create.main)
         │
         ▼
 Look up hook roles from ALL discovered collections
@@ -611,10 +666,11 @@ Sort all by phase (pre → main → post), then priority
 Generate AAP Workflow, submit
 ```
 
-The main-phase role comes from the *Class's collection. Pre/post
-hooks come from any collection that registers roles for the same
-resource type + event. This allows CSPs and partners to add
-hooks without modifying the provider collection.
+The main-phase role comes from the CatalogItem's collection.
+Pre/post hooks come from any collection that registers roles
+for the same resource type + event. This allows CSPs and
+partners to add hooks without modifying the provider
+collection.
 
 #### Why collection-per-provider
 
@@ -630,28 +686,27 @@ hooks without modifying the provider collection.
 - **Simpler roles.** Each role knows its backend. Simpler code,
   simpler tests.
 - **Swappable providers.** A CSP swaps backends by pointing
-  the *Class to a different collection. Same contract, different
-  implementation.
+  the CatalogItem to a different collection. Same contract,
+  different implementation.
 
 ### Part 3: ResourceAction Convention
 
-#### Unifying Templates, Dispatch, and Hooks
+#### Unifying CatalogItem Dispatch and Hooks
 
-Today OSAC has three related concepts:
+With upstream's introduction of CatalogItems, the provisioning
+model has three layers:
 
-| Concept | What it does | How it's configured |
+| Layer | What it does | Where it lives |
 |---|---|---|
-| Template | Ansible role + parameters → provisions a resource | Proto message in DB, auto-discovered from AAP |
-| Lifecycle dispatch | Ansible role → runs on CR event | Hardcoded in operator Go code |
-| Hook (proposed) | Ansible role → runs pre/post lifecycle | Does not exist |
+| CatalogItem | Tenant-facing offering with field constraints and visibility | fulfillment-service (proto + DB) |
+| ResourceAction | Ansible role + parameters + outputs → provisions a resource | Ansible collection (convention) |
+| Hook | Ansible role → runs pre/post lifecycle | Ansible collection (convention) |
 
-A Template *is* a `Create` main-phase ResourceAction with
-parameter definitions. A hook is a `PostCreate` post-phase
-ResourceAction. ResourceAction unifies all three as a **role
-naming and metadata convention**.
-
-Since CatalogItems are not yet implemented, this convergence
-happens without migration cost.
+A CatalogItem's `provisioning` metadata points to a collection
+and resource_action. The ResourceAction convention provides the
+naming and metadata for the actual Ansible roles. Hooks are
+ResourceActions from other collections that register for the
+same resource type and event.
 
 #### Role Naming Convention
 
@@ -852,12 +907,34 @@ conditions:
 
 Conditions are ANDed. No conditions = always runs.
 
-#### Template Replacement Example
+#### CatalogItem + ResourceAction Example
 
-A current `ComputeInstanceTemplate` for RHEL 10 becomes:
+A RHEL 10 GPU VM offering is composed from a CatalogItem
+(tenant presentation) and a ResourceAction (provisioning logic):
 
 ```yaml
-# roles/rhel10_vm.create.main/meta/osac.yaml (in osac.compute_kubevirt)
+# CatalogItem (in fulfillment-service)
+id: "rhel10-gpu-vm"
+title: "RHEL 10 GPU VM"
+description: "GPU-enabled virtual machine with RHEL 10"
+published: true
+provisioning:
+  collection: osac.compute_kubevirt
+  resource_action: instance
+field_definitions:
+  - field: cores
+    locked: false
+    default: 4
+  - field: memory_gib
+    locked: true
+    value: 64
+  - field: image
+    locked: true
+    value: "quay.io/osac/rhel10-gpu:latest"
+```
+
+```yaml
+# roles/instance.create.main/meta/osac.yaml (in osac.compute_kubevirt)
 resource_type: ComputeInstance
 event: Create
 phase: main
@@ -865,25 +942,11 @@ priority: 100
 failure_policy: Fail
 
 parameters:
-  - name: cores
-    type: integer
-    required: false
-    default: 4
-    description: Number of CPU cores
-  - name: memory_gib
-    type: integer
-    required: false
-    default: 16
-    description: Memory in GiB
-  - name: boot_disk_gib
-    type: integer
-    required: false
-    default: 100
-    description: Boot disk size in GiB
-  - name: image
+  - name: exposed_ports
     type: string
-    required: true
-    description: VM image reference
+    required: false
+    default: "22/tcp"
+    description: Ports to expose on the VM
 
 outputs:
   - name: instance_id
@@ -892,18 +955,18 @@ outputs:
   - name: ip_address
     type: string
     description: Primary IP address
-  - name: ssh_host
+  - name: hostname
     type: string
-    description: SSH-accessible hostname
+    description: VM hostname
 ```
 
-The existing `publish_templates` AAP role evolves to publish
-roles following this convention instead of calling the Template
-API.
-
-A CatalogItem references this role (by collection + role name)
-and adds presentation: field locking, defaults, tenant
-visibility, billing labels.
+The CatalogItem controls what the tenant sees and which fields
+they can change. The ResourceAction in the collection handles
+the actual provisioning. Multiple CatalogItems can reference
+the same ResourceAction with different field constraints —
+e.g., a "small VM" and "GPU VM" both use
+`osac.compute_kubevirt.instance.create.main` but with different
+locked field values.
 
 #### Priority Ranges (Convention)
 
@@ -1045,11 +1108,17 @@ configuration is needed.
 
 ```
 osac.compute_kubevirt/
-├── meta/addon.yaml          # declares resource_types
-├── roles/instance/          # ResourceAction roles
-├── playbooks/               # workflow entry points
-│   ├── create.yml           # → Job Template: <prefix>-compute-kubevirt-create
-│   └── delete.yml           # → Job Template: <prefix>-compute-kubevirt-delete
+├── meta/addon.yaml                  # declares resource_types
+├── roles/
+│   ├── instance.create.main/        # ResourceAction roles
+│   │   ├── meta/osac.yaml
+│   │   └── tasks/main.yml
+│   └── instance.delete.main/
+│       ├── meta/osac.yaml
+│       └── tasks/main.yml
+├── playbooks/                       # workflow entry points
+│   ├── create.yml                   # → Job Template: <prefix>-compute-kubevirt-create
+│   └── delete.yml                   # → Job Template: <prefix>-compute-kubevirt-delete
 └── plugins/filter/
 ```
 
@@ -1230,24 +1299,30 @@ at Blueprint authoring time.
 
 ```mermaid
 graph TB
+    COL["Ansible Collection<br/><i>Provider implementation</i>"]
     RA["ResourceAction<br/><i>Ansible role + parameters + outputs</i>"]
-    CI["CatalogItem<br/><i>Presentation + field constraints + billing</i>"]
+    CI["CatalogItem<br/><i>Presentation + field constraints + provisioning binding</i>"]
     BP["Blueprint<br/><i>DAG of CatalogItems with output wiring</i>"]
 
-    RA --> CI
-    CI --> BP
+    COL -->|contains| RA
+    CI -->|"provisioning.collection<br/>provisioning.resource_action"| RA
+    BP -->|composes| CI
 
+    style COL fill:#A30000,color:#fff
     style RA fill:#EE0000,color:#fff
     style CI fill:#4394E5,color:#fff
     style BP fill:#3E8635,color:#fff
 ```
 
+- **Ansible Collection** is the provider implementation. One
+  collection per provider, independently versioned.
 - **ResourceAction** defines what can be provisioned, what
   parameters are available, what outputs are produced, and how
-  lifecycle events are handled.
-- **CatalogItem** wraps a ResourceAction with tenant-facing
-  presentation: locked fields, defaults, published/unpublished,
-  billing labels.
+  lifecycle events are handled. Lives inside a collection.
+- **CatalogItem** binds a ResourceAction to a tenant-facing
+  offering: field locking, defaults, published/unpublished
+  visibility, billing labels, and provisioning metadata
+  (collection + resource_action).
 - **Blueprint** composes CatalogItems into a DAG. Node wiring
   references declared outputs.
 
@@ -1388,23 +1463,26 @@ ansible-galaxy collection publish \
   mycompany-osac_networking-1.0.0.tar.gz
 ```
 
-### Step 7: Create a *Class CR
+### Step 7: Create CatalogItems
 
 ```yaml
-kind: NetworkClass
-metadata:
-  name: mycompany
-  labels:
-    osac.io/addon: mycompany-networking
-spec:
-  collection: mycompany.osac_networking
-  capabilities: [L2_ISOLATION]
+# Via fulfillment-service API or config-as-code
+ComputeInstanceCatalogItem:
+  title: "MyCompany VM"
+  published: true
+  provisioning:
+    collection: mycompany.osac_networking
+    resource_action: virtual_network
+  field_definitions:
+    - field: cidr
+      locked: false
 ```
 
 ### Step 8: Package (Optional)
 
 Create an Enclave plugin or Helm chart that installs CRDs,
-*Class CRs, and ensures the collection is available on Hub.
+creates CatalogItems, and ensures the collection is available
+on Hub.
 
 ### Step 9: Label Everything
 
@@ -1422,7 +1500,7 @@ labels:
 | Naming convention is easy to get wrong | Compliance linter catches errors pre-publish; Automation Hub approval gate |
 | AAP Workflow generation adds complexity | Shared library; Workflow provides rollback which direct launch cannot |
 | Ordering conflicts between collections | Priority ranges by convention; linter warns on conflicts |
-| Template → ResourceAction migration | Parallel operation: Templates continue to work; `publish_templates` evolves to create conventional roles |
+| CatalogItem provisioning metadata adoption | Additive proto change; existing CatalogItems gain provisioning field without breaking |
 | CRD installation requires cluster-admin | CRDs installed by Enclave/Helm, not operator; operator uses `*.osac.io` wildcard RBAC |
 | UI plugin deferred | CLI + API fully functional |
 | Collection versioning conflicts | `meta/addon.yaml` declares `osac_core` version dependency; operator validates at discovery |
@@ -1439,8 +1517,8 @@ labels:
   node executes via `set_stats` output propagation.
 - Condition-based filtering.
 - Priority ordering across multiple collections.
-- Template migration: verify roles created by `publish_templates`
-  match convention and dispatch identically.
+- CatalogItem dispatch: verify CatalogItem provisioning
+  metadata drives correct collection and role selection.
 
 ### Add-On Contract
 
@@ -1459,12 +1537,13 @@ labels:
 
 ### Alpha
 
-- Collection naming convention (`io.<org>.<domain>[.<product>]`)
+- Collection naming convention (`<namespace>.<domain_provider>`)
   and role naming convention (`<resource>.<event>.<phase>`)
   finalized.
 - `meta/osac.yaml` and `meta/addon.yaml` schemas finalized.
 - Operator discovers actions from Automation Hub and caches.
-- *Class `collection` field drives dispatch.
+- CatalogItem `provisioning` metadata (collection +
+  resource_action) drives dispatch.
 - Generic reconciler dispatches via cached table.
 - `osac.compute_kubevirt` and `osac.networking_ovnk`
   collections published as first providers.
@@ -1474,9 +1553,8 @@ labels:
 ### Beta
 
 - All existing controllers migrated to generic reconciler.
-- Template → ResourceAction migration for ClusterTemplate and
-  ComputeInstanceTemplate.
-- `publish_templates` role creates conventional roles.
+- CatalogItem provisioning metadata proto added to
+  fulfillment-service.
 - AAP Workflow generation with rollback.
 - Object storage add-on as reference implementation.
 - Shared Workflow generation library with Blueprints.
@@ -1485,8 +1563,8 @@ labels:
 
 ### GA
 
-- Remove hardcoded dispatch and Template API.
-- CatalogItems reference ResourceActions (by collection + role).
+- Remove hardcoded dispatch.
+- All CatalogItems carry provisioning metadata.
 - Metrics in Prometheus (discovery count, dispatch duration,
   failure rate per action).
 - At least two add-ons validating the contract.
