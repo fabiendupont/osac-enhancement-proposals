@@ -3,7 +3,7 @@ title: OSAC Add-On Model
 authors:
   - fdupont@redhat.com
 creation-date: 2026-04-30
-last-updated: 2026-06-01
+last-updated: 2026-06-30
 tracking-link:
   - "OSAC-30: OSAC Use-Case Composability in Enclave Plugin"
   - "OSAC-291: Design plugin dependency model"
@@ -36,8 +36,8 @@ implementation:
   tooling:
     - https://github.com/fabiendupont/osac-addon-lint
   core:
-    - https://github.com/fabiendupont/osac-operator (feature/unified-compute-model)
-    - https://github.com/fabiendupont/osac-fulfillment-service (feature/unified-compute-model)
+    - https://github.com/fabiendupont/osac-operator (feature/unified-compute-model-v2)
+    - https://github.com/fabiendupont/osac-fulfillment-service (feature/unified-compute-model-v2)
   deprecated:
     - osac-aap: dissolved — all collections extracted to standalone repos
 replaces:
@@ -67,8 +67,7 @@ This EP covers:
    enabling independent partner lifecycle
 3. **ResourceAction convention** — role naming and metadata
    that maps resource lifecycle events to Ansible roles,
-   replacing hardcoded operator-to-AAP wiring and unifying
-   with the Template concept
+   replacing hardcoded operator-to-AAP wiring
 4. **Role I/O contract** — standardized inputs (parameters via
    `extra_vars`), outputs (via `set_stats`), and status
    reporting
@@ -101,10 +100,15 @@ However:
 - The operator hardcodes AAP role dispatch — add-ons cannot
   register provisioning logic without Go code changes.
 - CatalogItems now exist upstream
-  (`ComputeInstanceCatalogItem`, `ClusterCatalogItem`) with
-  published/unpublished visibility and field-level access
-  control, but they lack provisioning metadata — they don't
-  know which Ansible collection or role to invoke.
+  (`ComputeInstanceCatalogItem`, `ClusterCatalogItem`,
+  `BareMetalInstanceCatalogItem`) with published/unpublished
+  visibility and `field_definitions` for field-level access
+  control. InstanceType provides simple cores+memory SKUs.
+  ExternalIP replaces PublicIP. StorageBackend follows the
+  NetworkClass pattern. BareMetalInstance has a feedback
+  controller. However, CatalogItems still lack provisioning
+  metadata — they don't know which Ansible collection or role
+  to invoke.
 - There is no rollback mechanism when provisioning fails.
 - There is no validation that Ansible roles follow OSAC
   conventions.
@@ -179,8 +183,9 @@ plugin deploys it.
 ### User Stories
 
 - As an **OSAC core developer**, I want existing hardcoded
-  dispatch and Templates expressed as conventional Ansible
-  roles so that the operator uses a single discovery mechanism.
+  dispatch replaced by convention-based Ansible collections
+  with self-describing contracts so that the operator uses a
+  single discovery mechanism.
 
 - As an **add-on developer**, I want to register provisioning
   logic by publishing an Ansible collection with the right
@@ -209,7 +214,8 @@ plugin deploys it.
   status reporting.
 - Provide a compliance linter for convention validation.
 - Integrate with AAP Workflows for rollback.
-- Unify Templates and lifecycle dispatch into ResourceActions.
+- Establish the collection's `meta/osac.yaml` as the
+  self-describing contract, replacing the Template resource.
 - Align with OSAC-30 and OSAC-291.
 
 ### Non-Goals
@@ -220,6 +226,29 @@ plugin deploys it.
 - Replacing AAP as the execution engine.
 - Plugin marketplace beyond Automation Hub.
 - Cross-resource orchestration — Blueprints handle that.
+
+### Upstream Alignment (Since April 2026)
+
+Since this EP was first drafted, upstream OSAC has evolved
+significantly. The following table maps upstream changes to
+this EP's positioning:
+
+| Upstream Change | OSAC Add-On Position |
+|---|---|
+| **InstanceType** — simple cores+memory SKU | ComputeInstanceClass is the richer superset: capability ranges, collection binding, provider awareness. Propose renaming InstanceType to **ComputeInstanceType** for naming consistency. |
+| **ExternalIP** — renamed from PublicIP | Adopt upstream naming. Collection roles use `external_ip.*` ResourceAction naming. |
+| **StorageBackend** — platform-scoped entity | New collection domain: `osac.storage_*` providers. Validates the collection-per-provider model. |
+| **BareMetalInstance** + **BareMetalInstanceCatalogItem** | Validates the per-resource CatalogItem pattern and collection-per-provider: `osac.compute_metal3`. |
+| **Organizations → Tenants** rename | Adopt. Tenant isolation annotations remain `osac.openshift.io/tenant`. |
+| **Authorino → JWT+OPA** auth stack | No add-on impact — auth is platform-level, not add-on-level. |
+| **API design guidelines** (docs/API.md) | Align ProvisioningMetadata proto with codified conventions. |
+| **CatalogItem field_definitions** formalized | Validates the curation model — FieldDefinitions replace Template spec defaults. CatalogItem becomes the sole dispatch surface: ProvisioningMetadata for dispatch, FieldDefinitions for curation. |
+
+The upstream team is independently converging on the
+collection-per-provider model. The `meta/osac.yaml` metadata
+files, per-provider collection structure, and CatalogItem-based
+dispatch are being adopted organically. This EP provides the
+formal contract that codifies what is already emerging.
 
 ## Proposal
 
@@ -265,8 +294,7 @@ that follows OSAC conventions:
 - Collection-level metadata (`meta/addon.yaml`)
 - Roles following the ResourceAction naming convention
 - Per-role metadata (`meta/osac.yaml`)
-- Resource type protos (compiled into fulfillment-service)
-- CRDs (for osac-operator)
+- Resource type definitions (proto + CRD, compiled into core)
 
 **Enclave Plugin** (packaging/delivery layer) — how an add-on
 gets installed on infrastructure:
@@ -401,7 +429,6 @@ id: "rhel10-gpu-vm"
 title: "RHEL 10 GPU VM"
 description: "GPU-enabled virtual machine with RHEL 10"
 published: true
-template: "gpu-vm-template-id"
 provisioning:
   collection: osac.compute_kubevirt
   resource_action: instance
@@ -425,10 +452,65 @@ ComputeInstance CR
 ```
 
 This separates concerns cleanly:
-- **CatalogItem** = what the tenant sees + how it's provisioned
-- **Template** = the resource spec defaults (cores, memory, etc.)
+- **CatalogItem** = what the tenant sees (FieldDefinitions for
+  curation) + how it's provisioned (ProvisioningMetadata for
+  dispatch) — these are orthogonal concerns on the same resource
 - **Collection** = the provisioning implementation
-- **ResourceAction** = the role naming convention within the collection
+- **ResourceAction** = the role naming convention within the
+  collection, with `meta/osac.yaml` as the self-describing
+  contract (parameters, outputs, conditions)
+
+There is no separate Template resource. The collection's
+`meta/osac.yaml` carries the parameter schema and output
+contract that upstream Templates carried. CatalogItem
+FieldDefinitions handle spec defaults and constraints that
+Templates provided via `spec_defaults`.
+
+#### Semantic Resource Hierarchy
+
+The full resource hierarchy for compute (the pattern applies
+to all domains):
+
+```
+Collection (osac.compute_kubevirt)
+  └── ResourceAction role (instance.create.main)
+        └── meta/osac.yaml — self-describing contract
+                              (parameters, outputs, conditions)
+
+ComputeInstanceClass    — product line: which collections can
+                          fulfill, what capability ranges
+                          (cores min/max, memory, GPU)
+ComputeInstanceType     — specific size within a Class
+                          (exactly 4 cores, 16 GiB)
+ComputeInstanceCatalogItem — dispatch + curation:
+    ├── ProvisioningMetadata (collection + resource_action)
+    └── FieldDefinitions (path, editable, default, validation)
+ComputeInstance         — what the tenant creates
+```
+
+Design decisions:
+
+- **Class between Collection and Type**, not above Type.
+  A Class defines the *range* of valid sizes and *which
+  collections* can fulfill it. A Type picks a *specific point*
+  within that range. Analogy: Class ≈ AWS `m5` family,
+  Type ≈ `m5.xlarge`.
+
+- **CatalogItem is the sole dispatch surface.** ProvisioningMetadata
+  tells the operator *which collection and role* to invoke.
+  FieldDefinitions control *what the tenant can set*. These are
+  orthogonal concerns on the same resource.
+
+- **InstanceType → ComputeInstanceType.** Upstream added
+  `InstanceType` as a simple cores+memory resource. We propose
+  renaming to `ComputeInstanceType` for naming consistency with
+  `ComputeInstance`, `ComputeInstanceClass`, and
+  `ComputeInstanceCatalogItem`.
+
+- **No Template resource.** The collection's `meta/osac.yaml`
+  carries the parameter schema and output contract. CatalogItem
+  FieldDefinitions carry spec defaults. A separate Template
+  resource in fulfillment-service is redundant.
 
 ```mermaid
 graph LR
@@ -590,7 +672,6 @@ This flexibility means:
 id: "rhel10-vm"
 title: "RHEL 10 Virtual Machine"
 published: true
-template: "rhel10-template-id"
 provisioning:
   collection: osac.compute_kubevirt
   resource_action: instance
@@ -599,7 +680,6 @@ provisioning:
 id: "managed-ocp"
 title: "Managed OpenShift Cluster"
 published: true
-template: "ocp-hcp-template-id"
 provisioning:
   collection: osac.kubernetes_hcp
   resource_action: cluster
@@ -608,7 +688,6 @@ provisioning:
 id: "bare-metal-gpu"
 title: "Bare Metal GPU Node"
 published: true
-template: "bm-gpu-template-id"
 provisioning:
   collection: massopencloud.osac
   resource_action: host
@@ -788,10 +867,9 @@ dell.osac_object_storage
 acme.osac_compliance
   instance.post_create.post
 
-# Template replacement (parameterized create):
-osac.compute_kubevirt
-  rhel10_vm.create.main      # specific template role
-  win2022_vm.create.main     # specific template role
+# Different offerings use the SAME role via different CatalogItems:
+# CatalogItem "rhel10-vm" → osac.compute_kubevirt instance.create.main (field_definitions lock image to RHEL 10)
+# CatalogItem "win2022-vm" → osac.compute_kubevirt instance.create.main (field_definitions lock image to Win 2022)
 ```
 
 #### Per-Role Metadata: meta/osac.yaml
@@ -842,9 +920,13 @@ conditions: []
 | `phase` | enum | yes | `pre`, `main`, `post` |
 | `priority` | int | no | Ordering within phase (default 100) |
 | `failure_policy` | enum | no | `Fail` (default) or `Ignore` |
+| `title` | string | no | Human-readable role title |
+| `description` | string | no | Human-readable role description |
+| `internal` | bool | no | `true` marks helper roles excluded from dispatch |
 | `parameters` | list | no | Input parameter definitions |
 | `outputs` | list | no | Declared output schema |
 | `conditions` | list | no | Run only when resource matches |
+| `spec_defaults` | map | no | Default spec values applied when CatalogItem FieldDefinitions don't override |
 
 ##### Parameters (Input Contract)
 
@@ -860,10 +942,10 @@ parameters:
       maximum: 128
 ```
 
-Parameters are passed to the role as `extra_vars`. For
-ResourceActions that replace Templates, the parameters field
-carries the same information as the current
-`ParameterDefinition` proto message.
+Parameters are passed to the role as `extra_vars`. The
+`meta/osac.yaml` parameters field is the self-describing
+contract — it declares what the role accepts, replacing the
+need for a separate Template resource in fulfillment-service.
 
 ##### Outputs (Output Contract)
 
@@ -1519,6 +1601,9 @@ labels:
 - Priority ordering across multiple collections.
 - CatalogItem dispatch: verify CatalogItem provisioning
   metadata drives correct collection and role selection.
+- CatalogItem dispatch without Template: verify
+  FieldDefinitions apply spec defaults correctly when no
+  Template resource exists.
 
 ### Add-On Contract
 
@@ -1549,12 +1634,15 @@ labels:
   collections published as first providers.
 - `osac addon lint` validates naming, metadata, outputs.
 - `*.osac.io` wildcard RBAC for operator.
+- ComputeInstanceClass and ComputeInstanceType proto
+  definitions in fulfillment-service.
+- InstanceType renamed to ComputeInstanceType.
 
 ### Beta
 
 - All existing controllers migrated to generic reconciler.
-- CatalogItem provisioning metadata proto added to
-  fulfillment-service.
+- CatalogItem ProvisioningMetadata and FieldDefinitions
+  formalized (Template resource removed from fulfillment-service).
 - AAP Workflow generation with rollback.
 - Object storage add-on as reference implementation.
 - Shared Workflow generation library with Blueprints.
